@@ -1,0 +1,20 @@
+from abc import ABC, abstractmethod
+from src.domain.entities import Email, ClassificationResult
+
+class LLMPort(ABC):
+    """
+    Port (interface) defining the outgoing operations to classify emails using LLMs.
+    """
+
+    @abstractmethod
+    def classify_email(self, email: Email) -> ClassificationResult:
+        """
+        Submits an email to the LLM for classification.
+
+        Args:
+            email: The Email entity to analyze.
+
+        Returns:
+            A ClassificationResult entity containing the action and reasoning.
+        """
+        pass

@@ -1,0 +1,16 @@
+services:
+  zip-cli:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zip_cli
+    volumes:
+      - .env:/app/.env
+      - token.json:/app/token.json
+      - credentials.json:/app/credentials.json
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Direct HTTP requests to host machine's Ollama service when containerized
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    restart: "no"
