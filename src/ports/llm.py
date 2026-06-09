@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
-from src.domain.entities import Email, ClassificationResult
+
+from src.domain.entities import ClassificationResult, Email
+
 
 class LLMPort(ABC):
     """

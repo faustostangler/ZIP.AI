@@ -1,10 +1,13 @@
 import logging
+
 import httpx
+
 from src.config import settings
-from src.domain.entities import Email, ClassificationResult, EmailAction
+from src.domain.entities import ClassificationResult, Email, EmailAction
 from src.ports.llm import LLMPort
 
 logger = logging.getLogger("zip.ollama")
+
 
 class OllamaLLMAdapter(LLMPort):
     """
@@ -44,50 +47,57 @@ class OllamaLLMAdapter(LLMPort):
             "type": "object",
             "properties": {
                 "email_id": {"type": "string"},
-                "action": {"type": "string", "enum": ["archive", "delete", "label", "none"]},
+                "action": {
+                    "type": "string",
+                    "enum": ["archive", "delete", "label", "none"],
+                },
                 "label_to_add": {"type": ["string", "null"]},
-                "reason": {"type": "string"}
+                "reason": {"type": "string"},
             },
-            "required": ["email_id", "action", "label_to_add", "reason"]
+            "required": ["email_id", "action", "label_to_add", "reason"],
         }
 
         payload = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "user", "content": user_prompt},
             ],
             "format": schema,
             "stream": False,
             "options": {
                 "temperature": 0.0  # Determinstic output
-            }
+            },
         }
 
         url = f"{self.base_url}/api/chat"
 
         try:
-            logger.info(f"Classifying email {email.id} using Ollama model '{self.model}'")
+            logger.info(
+                f"Classifying email {email.id} using Ollama model '{self.model}'"
+            )
             response = self.client.post(url, json=payload)
             response.raise_for_status()
-            
+
             data = response.json()
             message_content = data["message"]["content"]
             logger.debug(f"Ollama raw response for {email.id}: {message_content}")
-            
+
             # Load the JSON result
             result_json = ClassificationResult.model_validate_json(message_content)
-            
+
             # Ensure the email_id matches
             result_json.email_id = email.id
             return result_json
 
         except Exception as e:
-            logger.error(f"Failed to classify email {email.id} via Ollama: {e}", exc_info=True)
+            logger.error(
+                f"Failed to classify email {email.id} via Ollama: {e}", exc_info=True
+            )
             # Fail-safe fallback: keep in inbox (none) with error context
             return ClassificationResult(
                 email_id=email.id,
                 action=EmailAction.NONE,
                 label_to_add=None,
-                reason=f"Failed classification due to Ollama error: {str(e)}"
+                reason=f"Failed classification due to Ollama error: {e!s}",
             )

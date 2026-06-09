@@ -22,6 +22,8 @@ dev = [
     "pytest-mock>=3.14.0",
     "ruff>=0.3.0",
     "mypy>=1.9.0",
+    "coverage>=7.14.1",
+    "pytest-cov>=7.1.0",
 ]
 
 [tool.ruff]
@@ -30,7 +32,7 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "C4", "RUF"]
-ignore = []
+ignore = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -38,3 +40,7 @@ pythonpath = ["."]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
+
+[tool.mypy]
+ignore_missing_imports = true
+explicit_package_bases = true

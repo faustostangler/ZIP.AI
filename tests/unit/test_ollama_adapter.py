@@ -9,11 +9,7 @@ from src.config import settings
 from src.domain.entities import Email, EmailAction
 
 
-def test_ollama_classify_success(mocker):
-    """
-    Test that OllamaLLMAdapter correctly formats requests and parses successful JSON responses.
-    """
-    # 1. Arrange
+def test_ollama_classify_success():
     mock_client = MagicMock(spec=httpx.Client)
 
     mock_response_data = {
@@ -46,16 +42,13 @@ def test_ollama_classify_success(mocker):
         labels=[],
     )
 
-    # 2. Act
     result = adapter.classify_email(test_email)
 
-    # 3. Assert
     assert result.email_id == "msg-123"
     assert result.action == EmailAction.DELETE
     assert result.label_to_add is None
     assert result.reason == "Phishing detection"
 
-    # Verify post arguments
     mock_client.post.assert_called_once()
     call_args, call_kwargs = mock_client.post.call_args
     assert call_args[0].endswith("/api/chat")
@@ -65,11 +58,7 @@ def test_ollama_classify_success(mocker):
     assert payload["format"]["type"] == "object"
 
 
-def test_ollama_classify_http_error(mocker):
-    """
-    Test that OllamaLLMAdapter handles HTTP errors by falling back gracefully to NONE.
-    """
-    # 1. Arrange
+def test_ollama_classify_http_error():
     mock_client = MagicMock(spec=httpx.Client)
     mock_client.post.side_effect = httpx.HTTPError("Connection refused")
 
@@ -85,10 +74,8 @@ def test_ollama_classify_http_error(mocker):
         labels=[],
     )
 
-    # 2. Act
     result = adapter.classify_email(test_email)
 
-    # 3. Assert
     assert result.email_id == "msg-456"
     assert result.action == EmailAction.NONE
     assert result.label_to_add is None
