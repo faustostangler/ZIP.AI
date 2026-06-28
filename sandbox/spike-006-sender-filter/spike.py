@@ -64,19 +64,24 @@ def load_processed_senders():
     if path.exists():
         with open(path, "r") as f:
             try:
-                return json.load(f)
+                data = json.load(f)
+                if isinstance(data, list):
+                    # Convert list format to dict for backwards compatibility
+                    return {email: "newsletter" for email in data}
+                elif isinstance(data, dict):
+                    return data
             except Exception:
-                return []
-    return []
+                return {}
+    return {}
 
-def save_processed_sender(email):
+def save_processed_sender(email, category):
     path = Path("sandbox_processed_senders.json")
     senders = load_processed_senders()
     if email not in senders:
-        senders.append(email)
+        senders[email] = category
         with open(path, "w") as f:
             json.dump(senders, f, indent=4)
-        print(f"Saved {email} to sandbox_processed_senders.json")
+        print(f"Saved {email} ({category}) to sandbox_processed_senders.json")
 
 def find_unseen_sender(service, processed_list):
     print("Listing latest inbox messages...")
@@ -236,6 +241,215 @@ def classify_sender(env, email_addr, history):
         duration = time.perf_counter() - start_time
         print(f"Error calling LLM after {duration:.2f}s: {e}")
         return False
+
+class GeminiWebClassifier:
+    def __init__(self, user_data_dir: Path):
+        self.user_data_dir = user_data_dir
+        self.playwright = None
+        self.context = None
+        self.page = None
+
+    def __enter__(self):
+        from playwright.sync_api import sync_playwright
+        self.playwright = sync_playwright().start()
+        
+        # Launch Chromium/Chrome persistent context with evasion parameters to bypass "secure browser" checks
+        user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        args = ["--disable-blink-features=AutomationControlled"]
+        
+        try:
+            print("[Playwright] Attempting to launch persistent Chrome context...")
+            self.context = self.playwright.chromium.launch_persistent_context(
+                user_data_dir=str(self.user_data_dir.resolve()),
+                headless=False,
+                channel="chrome",
+                slow_mo=100,
+                user_agent=user_agent,
+                args=args,
+                ignore_default_args=["--enable-automation"]
+            )
+        except Exception as e:
+            print(f"[Playwright] Failed to launch with Google Chrome channel ({e}). Falling back to Chromium...")
+            self.context = self.playwright.chromium.launch_persistent_context(
+                user_data_dir=str(self.user_data_dir.resolve()),
+                headless=False,
+                slow_mo=100,
+                user_agent=user_agent,
+                args=args,
+                ignore_default_args=["--enable-automation"]
+            )
+        self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+        
+        # Navigate to Gemini
+        print("[Playwright] Navigating to Gemini...")
+        self.page.goto("https://gemini.google.com/", timeout=60000)
+        self.page.wait_for_timeout(3000)
+        
+        # Check login status by checking prompt visibility
+        selector = "div[contenteditable='true'], textarea#prompt-textarea, [role='combobox']"
+        prompt_element = self.page.locator(selector).first
+        
+        try:
+            prompt_element.wait_for(state="visible", timeout=3000)
+            # Prompt the user to confirm they are using the correct logged-in account
+            print("\n" + "="*50)
+            print("👤  [Playwright] GEMINI SESSION DETECTED")
+            print("Please check the browser window to confirm you are logged into the correct Google account.")
+            input("PRESS ENTER in this terminal to continue if everything is correct...")
+            print("="*50 + "\n")
+        except Exception:
+            print("\n" + "="*50)
+            print("⚠️  [Playwright] GOOGLE LOGIN REQUIRED!")
+            print("A browser window has opened. Please log into your Google account in that window.")
+            input("Once logged in and Gemini is ready, PRESS ENTER in this terminal to continue...")
+            print("="*50 + "\n")
+            
+            # Wait for input area to become visible
+            prompt_element.wait_for(state="visible", timeout=0)
+            
+        return self
+
+    def classify(self, email_addr, history):
+        print(f"Classifying sender {email_addr} using Gemini Web...")
+        import re
+        import json
+        
+        # 1. Format the email history prompt
+        history_str = ""
+        for idx, item in enumerate(history, 1):
+            history_str += f"Email {idx}:\nSubject: {item['subject']}\nBody: {item['body'][:1200]}\n\n"
+            
+        prompt_text = (
+            "You are an email analysis bot. Analyze the sender's history and classify the sender into exactly ONE of the following categories:\n"
+            "1. 'personal': Direct human-to-human conversations or personal direct messages.\n"
+            "2. 'profissional': Emails related to work, business, or professional activities.\n"
+            "3. 'transactional': Invoices, billing, order tracking, purchase confirmations, or financial statements.\n"
+            "4. 'security': Password resets, login alerts, 2FA verification codes, or access authorizations.\n"
+            "5. 'notification': Calendar invites, system updates, social media notifications, or collaboration pings (Jira, Slack, GitHub).\n"
+            "6. 'other': Emails that do not fall into any of the above categories.\n\n"
+            "Return a JSON object conforming exactly to this schema:\n"
+            "{\n"
+            "  \"category\": string\n"
+            "}\n\n"
+            f"Sender: {email_addr}\nHistory:\n{history_str}"
+        )
+        
+        category = "transactional"
+        
+        try:
+            # We go to the base URL to ensure we start a clean chat session or are on the main page
+            self.page.goto("https://gemini.google.com/", timeout=60000)
+            
+            # Wait for prompt textarea
+            selector = "div[contenteditable='true'], textarea#prompt-textarea, [role='combobox']"
+            prompt_element = self.page.locator(selector).first
+            prompt_element.wait_for(state="visible", timeout=15000)
+            
+            # Input the prompt
+            print("[Playwright] Inputting prompt...")
+            prompt_element.focus()
+            prompt_element.fill(prompt_text)
+            
+            # Send
+            self.page.wait_for_timeout(500)
+            send_selectors = [
+                "button[aria-label*='Send']",
+                "button[aria-label*='Enviar']",
+                "button.send-button",
+                "button[type='submit']",
+                "div.send-button-container button"
+            ]
+            send_button = None
+            for sel in send_selectors:
+                btn = self.page.locator(sel).first
+                if btn.is_visible() and btn.is_enabled():
+                    send_button = btn
+                    break
+                    
+            if send_button:
+                send_button.click()
+            else:
+                self.page.keyboard.press("Enter")
+                
+            print("[Playwright] Waiting for response to generate...")
+            self.page.wait_for_timeout(4000)
+            
+            # Polling strategy for stability
+            last_text = ""
+            stable_count = 0
+            for _ in range(60):
+                responses = self.page.locator("message-content, .message-content, .model-response, div[class*='message-content']").all()
+                if responses:
+                    current_text = responses[-1].inner_text()
+                    if current_text and current_text == last_text:
+                        stable_count += 1
+                        if stable_count >= 3:
+                            break
+                    else:
+                        stable_count = 0
+                        last_text = current_text
+                self.page.wait_for_timeout(1000)
+                
+            print("[Playwright] Parsing response content...")
+            json_match = re.search(r"\{[\s\S]*?\}", last_text)
+            parsed_category = None
+            if json_match:
+                try:
+                    res_dict = json.loads(json_match.group(0))
+                    parsed_category = res_dict.get("category")
+                except Exception:
+                    pass
+            
+            if not parsed_category:
+                # Text-based fallback scanning
+                lower_text = last_text.lower()
+                for cat in ["newsletter", "transactional", "personal", "security", "notification"]:
+                    if cat in lower_text:
+                        parsed_category = cat
+                        break
+                        
+            if parsed_category:
+                category = parsed_category.strip().lower()
+                
+            print(f"[Playwright] Gemini decision: category = {category}")
+            
+            # Delete chat thread
+            print("[Playwright] Deleting chat thread...")
+            try:
+                # Open menu/sidebar if collapsed
+                menu_btn = self.page.locator("button[aria-label*='Menu'], button[aria-label*='Expand']").first
+                if menu_btn.is_visible():
+                    menu_btn.click()
+                    self.page.wait_for_timeout(500)
+                    
+                action_btn = self.page.locator("button[aria-label*='actions'], button[aria-label*='opções'], button[aria-label*='Options']").first
+                if action_btn.is_visible():
+                    action_btn.click()
+                    
+                    # Wait for and click the 'Delete' option in the dropdown menu
+                    delete_opt = self.page.locator("span:has-text('Delete'), span:has-text('Excluir'), [role='menuitem']:has-text('Delete'), [role='menuitem']:has-text('Excluir'), [class*='delete']").first
+                    delete_opt.wait_for(state="visible", timeout=5000)
+                    delete_opt.click()
+                    
+                    # Wait for and click the 'Delete' button in the confirmation modal/dialog
+                    confirm_btn = self.page.locator("[role='dialog'], mat-dialog-container, [class*='dialog']").locator("button:has-text('Delete'), button:has-text('Excluir')").first
+                    confirm_btn.wait_for(state="visible", timeout=5000)
+                    confirm_btn.click()
+                    print("[Playwright] Chat thread successfully deleted.")
+                    self.page.wait_for_timeout(1000)
+            except Exception as delete_error:
+                print(f"[Playwright] Could not delete chat session: {delete_error}")
+                
+        except Exception as e:
+            print(f"[Playwright] Error in Gemini Web classification: {e}")
+            
+        return category
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.context:
+            self.context.close()
+        if self.playwright:
+            self.playwright.stop()
 
 def create_gmail_filter(service, email_addr):
     print(f"Adding {email_addr} to consolidated Gmail commercial filter...")
@@ -420,134 +634,138 @@ def input_with_timeout(prompt: str, timeout: float = 5.0, default: str = "y") ->
     else:
         print(f"\n[Timeout] Auto-selecting default: {default}")
         return default
+
 def main():
     print("Starting Sandbox Spike...")
     env = load_env()
     service = get_gmail_service(env)
     
-    processed_list = load_processed_senders()
-    processed_set = set(processed_list)
+    processed_dict = load_processed_senders()
+    processed_set = set(processed_dict.keys())
     print(f"Loaded processed list with {len(processed_set)} senders.")
     
-    next_page_token = None
-    evaluated_messages_count = 0
-    processed_senders_count = 0
+    user_data_dir = Path("sandbox/playwright_user_data")
+    user_data_dir.mkdir(parents=True, exist_ok=True)
     
-    print("Starting message-by-message inbox analysis...")
-    while True:
-        print(f"Fetching page of inbox messages (token: {next_page_token})...")
-        try:
-            results = service.users().messages().list(
-                userId="me", 
-                q="label:INBOX", 
-                maxResults=50, 
-                pageToken=next_page_token
-            ).execute()
-        except Exception as e:
-            print(f"Error listing messages: {e}")
-            break
-            
-        messages = results.get("messages", [])
-        next_page_token = results.get("nextPageToken")
+    with GeminiWebClassifier(user_data_dir) as classifier:
+        next_page_token = None
+        evaluated_messages_count = 0
+        processed_senders_count = 0
         
-        if not messages:
-            print("No more messages in INBOX.")
-            break
+        print("Starting message-by-message inbox analysis...")
+        while True:
+            print(f"Fetching page of inbox messages (token: {next_page_token})...")
+            try:
+                results = service.users().messages().list(
+                    userId="me", 
+                    q="label:INBOX", 
+                    maxResults=50, 
+                    pageToken=next_page_token
+                ).execute()
+            except Exception as e:
+                print(f"Error listing messages: {e}")
+                break
+                
+            messages = results.get("messages", [])
+            next_page_token = results.get("nextPageToken")
             
-        print(f"Fetching metadata for {len(messages)} messages using Gmail API Batch Request...")
-        senders_map = {}
-        
-        def batch_callback(request_id, response, exception):
-            if exception is not None:
-                return
-            msg_id = response.get("id")
-            headers = response.get("payload", {}).get("headers", [])
-            for h in headers:
-                if h.get("name", "").lower() == "from":
-                    senders_map[msg_id] = h.get("value", "")
-                    break
+            if not messages:
+                print("No more messages in INBOX.")
+                break
+                
+            print(f"Fetching metadata for {len(messages)} messages using Gmail API Batch Request...")
+            senders_map = {}
+            
+            def batch_callback(request_id, response, exception):
+                if exception is not None:
+                    return
+                msg_id = response.get("id")
+                headers = response.get("payload", {}).get("headers", [])
+                for h in headers:
+                    if h.get("name", "").lower() == "from":
+                        senders_map[msg_id] = h.get("value", "")
+                        break
+                        
+            batch = service.new_batch_http_request(callback=batch_callback)
+            for msg in messages:
+                batch.add(service.users().messages().get(
+                    userId="me",
+                    id=msg["id"],
+                    format="metadata",
+                    metadataHeaders=["From"]
+                ))
+                
+            try:
+                batch.execute()
+            except Exception as e:
+                print(f"Error executing batch request: {e}")
+                break
+    
+            for msg in messages:
+                msg_id = msg["id"]
+                evaluated_messages_count += 1
+                
+                from_val = senders_map.get(msg_id)
+                if not from_val:
+                    continue
                     
-        batch = service.new_batch_http_request(callback=batch_callback)
-        for msg in messages:
-            batch.add(service.users().messages().get(
-                userId="me",
-                id=msg["id"],
-                format="metadata",
-                metadataHeaders=["From"]
-            ))
-            
-        try:
-            batch.execute()
-        except Exception as e:
-            print(f"Error executing batch request: {e}")
-            break
-
-        for msg in messages:
-            msg_id = msg["id"]
-            evaluated_messages_count += 1
-            
-            from_val = senders_map.get(msg_id)
-            if not from_val:
-                continue
+                email_addr = from_val
+                if "<" in from_val and ">" in from_val:
+                    email_addr = from_val.split("<")[1].split(">")[0]
+                email_addr = email_addr.strip().lower()
                 
-            email_addr = from_val
-            if "<" in from_val and ">" in from_val:
-                email_addr = from_val.split("<")[1].split(">")[0]
-            email_addr = email_addr.strip().lower()
-            
-            # Skip if already processed in this run or historically
-            if email_addr in processed_set:
-                continue
+                # Skip if already processed in this run or historically
+                if email_addr in processed_set:
+                    continue
+                    
+                # We found a new unprocessed sender!
+                print(f"\n==========================================")
+                print(f"Processing new sender: {email_addr} (From: {from_val})")
                 
-            # We found a new unprocessed sender!
-            print(f"\n==========================================")
-            print(f"Processing new sender: {email_addr} (From: {from_val})")
-            
-            history, unsub_link = fetch_sender_history(service, email_addr)
-            print(f"Fetched {len(history)} messages from sender history.")
-
-            is_newsletter = False
-            if unsub_link:
-                print(f"Unsubscribe link found: {unsub_link}")
-                
-                # Query user with 1 second timeout
-                prompt_str = f"Do you want to unsubscribe from '{email_addr}'? [Y/n] (Auto-yes in 1s): "
-                choice = input_with_timeout(prompt_str, timeout=1.0, default="y")
-                
-                if choice in ("y", "yes"):
-                    try:
-                        print("Attempting to unsubscribe by opening link...")
-                        # Make a GET request to the unsubscribe link
-                        r = httpx.get(unsub_link, timeout=10.0, follow_redirects=True)
-                        print(f"Unsubscribe request status code: {r.status_code}")
-                    except Exception as e:
-                        print(f"Failed to request unsubscribe link: {e}")
+                history, unsub_link = fetch_sender_history(service, email_addr)
+                print(f"Fetched {len(history)} messages from sender history.")
+    
+                category = "newsletter"
+                if unsub_link:
+                    print(f"Unsubscribe link found: {unsub_link}")
+                    
+                    # Query user with 1 second timeout
+                    prompt_str = f"Do you want to unsubscribe from '{email_addr}'? [Y/n] (Auto-yes in 1s): "
+                    choice = input_with_timeout(prompt_str, timeout=1.0, default="y")
+                    
+                    if choice in ("y", "yes"):
+                        try:
+                            print("Attempting to unsubscribe by opening link...")
+                            # Make a GET request to the unsubscribe link
+                            r = httpx.get(unsub_link, timeout=10.0, follow_redirects=True)
+                            print(f"Unsubscribe request status code: {r.status_code}")
+                        except Exception as e:
+                            print(f"Failed to request unsubscribe link: {e}")
+                    else:
+                        print("Skipped automated unsubscribe request.")
+                    
+                    # Bypass LLM: mark as newsletter directly
+                    category = "newsletter"
                 else:
-                    print("Skipped automated unsubscribe request.")
+                    category = classifier.classify(email_addr, history)
                 
-                # Bypass LLM: mark as newsletter directly
-                is_newsletter = True
-            else:
-                is_newsletter = classify_sender(env, email_addr, history)
-                # is_newsletter = False
-                # print("Temporarily classified as transactional")
-            
-            if is_newsletter:
-                create_gmail_filter(service, email_addr)
-            else:
-                print(f"Sender {email_addr} is transactional. No filter created.")
+                is_newsletter = (category == "newsletter")
+                if is_newsletter:
+                    create_gmail_filter(service, email_addr)
+                else:
+                    print(f"Sender {email_addr} is classified as '{category}'. No Gmail filter created.")
+                    
+                # Always save processed sender with its category to prevent re-evaluation
+                save_processed_sender(email_addr, category)
+    
+                processed_set.add(email_addr)
+                processed_senders_count += 1
                 
-            if is_newsletter:
-                save_processed_sender(email_addr)
-
-            processed_set.add(email_addr)
-            processed_senders_count += 1
-            
-        if not next_page_token:
-            print("Reached the end of the INBOX (no nextPageToken).")
-            break
-            
-    print(f"\nSandbox Spike completed. Evaluated {evaluated_messages_count} messages, processed {processed_senders_count} new senders.")
+            if not next_page_token:
+                print("Reached the end of the INBOX (no nextPageToken).")
+                break
+                
+        print(f"\nSandbox Spike completed. Evaluated {evaluated_messages_count} messages, processed {processed_senders_count} new senders.")
 
 if __name__ == "__main__":
     main()
