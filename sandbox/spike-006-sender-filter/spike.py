@@ -320,21 +320,25 @@ class GeminiWebClassifier:
             history_str += f"Email {idx}:\nSubject: {item['subject']}\nBody: {item['body'][:1200]}\n\n"
             
         prompt_text = (
-            "You are an email analysis bot. Analyze the sender's history and classify the sender into exactly ONE of the following categories:\n"
-            "1. 'personal': Direct human-to-human conversations or personal direct messages.\n"
-            "2. 'profissional': Emails related to work, business, or professional activities.\n"
-            "3. 'transactional': Invoices, billing, order tracking, purchase confirmations, or financial statements.\n"
-            "4. 'security': Password resets, login alerts, 2FA verification codes, or access authorizations.\n"
-            "5. 'notification': Calendar invites, system updates, social media notifications, or collaboration pings (Jira, Slack, GitHub).\n"
-            "6. 'other': Emails that do not fall into any of the above categories.\n\n"
+            "You are an email analysis bot. Analyze the sender's history and determine:\n"
+            "1. If the sender is a Newsletter (automatic promotions, marketing, newsletters, content digests, subscriptions).\n"
+            "2. If it is NOT a newsletter, classify it into exactly ONE of the following categories:\n"
+            "   - 'personal': Direct human-to-human conversations or personal direct messages.\n"
+            "   - 'profissional': Emails related to work, business, or professional activities.\n"
+            "   - 'transactional': Invoices, billing, order tracking, purchase confirmations, or financial statements.\n"
+            "   - 'security': Password resets, login alerts, 2FA verification codes, or access authorizations.\n"
+            "   - 'notification': Calendar invites, system updates, social media notifications, or collaboration pings (Jira, Slack, GitHub).\n"
+            "   - 'other': Emails that do not fall into any of the above categories.\n\n"
             "Return a JSON object conforming exactly to this schema:\n"
             "{\n"
+            "  \"is_newsletter\": boolean,\n"
             "  \"category\": string\n"
             "}\n\n"
             f"Sender: {email_addr}\nHistory:\n{history_str}"
         )
         
-        category = "transactional"
+        is_newsletter = False
+        category = "other"
         
         try:
             # We go to the base URL to ensure we start a clean chat session or are on the main page
@@ -392,26 +396,32 @@ class GeminiWebClassifier:
                 
             print("[Playwright] Parsing response content...")
             json_match = re.search(r"\{[\s\S]*?\}", last_text)
-            parsed_category = None
+            parsed_json = None
             if json_match:
                 try:
-                    res_dict = json.loads(json_match.group(0))
-                    parsed_category = res_dict.get("category")
+                    parsed_json = json.loads(json_match.group(0))
                 except Exception:
                     pass
             
-            if not parsed_category:
+            if parsed_json and isinstance(parsed_json, dict):
+                is_newsletter = parsed_json.get("is_newsletter", False)
+                category = parsed_json.get("category", "other")
+            else:
                 # Text-based fallback scanning
                 lower_text = last_text.lower()
-                for cat in ["newsletter", "transactional", "personal", "security", "notification"]:
+                is_newsletter = "is_newsletter\": true" in lower_text or '"is_newsletter": true' in lower_text
+                
+                # Check for categories in text
+                for cat in ["personal", "profissional", "transactional", "security", "notification", "other"]:
                     if cat in lower_text:
-                        parsed_category = cat
+                        category = cat
                         break
                         
-            if parsed_category:
-                category = parsed_category.strip().lower()
+            category = category.strip().lower()
+            if is_newsletter:
+                category = "newsletter"
                 
-            print(f"[Playwright] Gemini decision: category = {category}")
+            print(f"[Playwright] Gemini decision: is_newsletter = {is_newsletter}, category = {category}")
             
             # Delete chat thread
             print("[Playwright] Deleting chat thread...")
@@ -443,7 +453,7 @@ class GeminiWebClassifier:
         except Exception as e:
             print(f"[Playwright] Error in Gemini Web classification: {e}")
             
-        return category
+        return is_newsletter, category
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.context:
@@ -553,6 +563,148 @@ def create_gmail_filter(service, email_addr):
                         "ids": chunk,
                         "addLabelIds": ["TRASH"],
                         "removeLabelIds": ["INBOX", "UNREAD"]
+                    }
+                ).execute()
+            print("Retroactive filter application completed.")
+        else:
+            print("No existing messages found to retroactively filter.")
+    except Exception as e:
+        print(f"Error applying filter retroactively: {e}")
+
+
+def get_or_create_label(service, label_name):
+    # List existing labels
+    try:
+        results = service.users().labels().list(userId="me").execute()
+        labels = results.get("labels", [])
+        for label in labels:
+            if label["name"].lower() == label_name.lower():
+                return label["id"]
+    except Exception as e:
+        print(f"Error listing labels: {e}")
+        
+    # Create label if not found
+    try:
+        print(f"Label '{label_name}' not found. Creating it...")
+        label_body = {
+            "name": label_name,
+            "labelListVisibility": "labelShow",
+            "messageListVisibility": "show"
+        }
+        created_label = service.users().labels().create(userId="me", body=label_body).execute()
+        return created_label["id"]
+    except Exception as e:
+        print(f"Error creating label '{label_name}': {e}")
+        return None
+
+
+def create_gmail_category_filter(service, email_addr, category):
+    # Capitalize label name
+    label_name = category.capitalize()
+    print(f"Adding {email_addr} to consolidated Gmail category filter: {label_name}...")
+    
+    # 0. Get or create label ID
+    label_id = get_or_create_label(service, label_name)
+    if not label_id:
+        print(f"Could not get or create label for '{label_name}'. Aborting filter creation.")
+        return
+        
+    # 1. Fetch all filters
+    try:
+        results = service.users().settings().filters().list(userId="me").execute()
+        filters = results.get("filter", [])
+    except Exception as e:
+        print(f"Error listing filters: {e}")
+        filters = []
+        
+    target_filter = None
+    # Look for the consolidated filter: action contains this category's label_id and removes from INBOX
+    for flt in filters:
+        action = flt.get("action", {})
+        add_labels = action.get("addLabelIds", [])
+        remove_labels = action.get("removeLabelIds", [])
+        if label_id in add_labels and "INBOX" in remove_labels:
+            target_filter = flt
+            break
+            
+    existing_senders = set()
+    old_filter_id = None
+    
+    if target_filter:
+        old_filter_id = target_filter["id"]
+        from_criteria = target_filter.get("criteria", {}).get("from", "")
+        # Clean up parentheses
+        cleaned_from = from_criteria.strip()
+        if cleaned_from.startswith("(") and cleaned_from.endswith(")"):
+            cleaned_from = cleaned_from[1:-1].strip()
+            
+        # Parse existing emails
+        import re
+        parts = re.split(r'\s+[oO][rR]\s+', cleaned_from)
+        for part in parts:
+            p = part.strip().lower()
+            if p:
+                existing_senders.add(p)
+                
+    # Add new email address to set
+    existing_senders.add(email_addr.strip().lower())
+    
+    # Format the new criteria from string
+    if len(existing_senders) > 1:
+        from_str = f"({' OR '.join(sorted(existing_senders))})"
+    else:
+        from_str = next(iter(existing_senders))
+        
+    filter_body = {
+        "criteria": {"from": from_str},
+        "action": {
+            "removeLabelIds": ["INBOX"],
+            "addLabelIds": [label_id]
+        }
+    }
+    
+    # Delete the old filter if it exists
+    if old_filter_id:
+        try:
+            print(f"Deleting old category filter (id: {old_filter_id})...")
+            service.users().settings().filters().delete(userId="me", id=old_filter_id).execute()
+        except Exception as e:
+            print(f"Error deleting old category filter: {e}")
+            
+    # Create the new updated filter
+    try:
+        res = service.users().settings().filters().create(userId="me", body=filter_body).execute()
+        print(f"Consolidated '{label_name}' filter updated/created successfully: {res}")
+    except Exception as e:
+        print(f"Error creating updated category filter: {e}")
+        
+    # Retroactively move all existing emails from the new sender
+    try:
+        print(f"Applying filter retroactively to all existing messages from {email_addr}...")
+        messages = []
+        next_page_token = None
+        while True:
+            results = service.users().messages().list(
+                userId="me", q=f"from:{email_addr}", pageToken=next_page_token
+            ).execute()
+            messages.extend(results.get("messages", []))
+            next_page_token = results.get("nextPageToken")
+            if not next_page_token:
+                break
+                
+        if messages:
+            msg_ids = [m["id"] for m in messages]
+            print(f"Adding label '{label_name}' and removing from INBOX for {len(msg_ids)} existing messages...")
+            
+            chunk_size = 1000
+            for i in range(0, len(msg_ids), chunk_size):
+                chunk = msg_ids[i:i + chunk_size]
+                service.users().messages().batchModify(
+                    userId="me",
+                    body={
+                        "ids": chunk,
+                        "addLabelIds": [label_id],
+                        "removeLabelIds": ["INBOX"]
                     }
                 ).execute()
             print("Retroactive filter application completed.")
@@ -725,7 +877,9 @@ def main():
                 history, unsub_link = fetch_sender_history(service, email_addr)
                 print(f"Fetched {len(history)} messages from sender history.")
     
-                category = "newsletter"
+                is_newsletter = False
+                category = "other"
+                
                 if unsub_link:
                     print(f"Unsubscribe link found: {unsub_link}")
                     
@@ -745,18 +899,19 @@ def main():
                         print("Skipped automated unsubscribe request.")
                     
                     # Bypass LLM: mark as newsletter directly
+                    is_newsletter = True
                     category = "newsletter"
                 else:
-                    category = classifier.classify(email_addr, history)
+                    is_newsletter, category = classifier.classify(email_addr, history)
                 
-                is_newsletter = (category == "newsletter")
                 if is_newsletter:
+                    # Newsletters go to trash consolidated filter
                     create_gmail_filter(service, email_addr)
+                    save_processed_sender(email_addr, "newsletter")
                 else:
-                    print(f"Sender {email_addr} is classified as '{category}'. No Gmail filter created.")
-                    
-                # Always save processed sender with its category to prevent re-evaluation
-                save_processed_sender(email_addr, category)
+                    # Non-newsletters get category label applied and removed from Inbox
+                    create_gmail_category_filter(service, email_addr, category)
+                    save_processed_sender(email_addr, category)
     
                 processed_set.add(email_addr)
                 processed_senders_count += 1
