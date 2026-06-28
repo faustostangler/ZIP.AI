@@ -179,3 +179,72 @@ def test_apply_action_none(mock_gmail_adapter):
     mock_modify.assert_called_once_with(
         userId="me", id="msg-1", body={"removeLabelIds": ["UNREAD"]}
     )
+
+
+def test_fetch_emails_by_sender_success(mock_gmail_adapter):
+    adapter, mock_service = mock_gmail_adapter
+
+    mock_service.users().messages().list.return_value.execute.return_value = {
+        "messages": [{"id": "msg-2", "threadId": "thread-2"}]
+    }
+
+    mock_service.users().messages().get.return_value.execute.return_value = {
+        "id": "msg-2",
+        "threadId": "thread-2",
+        "labelIds": [],
+        "payload": {
+            "mimeType": "text/plain",
+            "headers": [
+                {"name": "Subject", "value": "Newsletter"},
+                {"name": "From", "value": "news@store.com"},
+                {"name": "Date", "value": "Tue, 09 Jun 2026 15:00:00 -0300"},
+            ],
+            "body": {"data": "SGVsbG8="},
+        },
+    }
+
+    emails = adapter.fetch_emails_by_sender("news@store.com")
+    assert len(emails) == 1
+    assert emails[0].id == "msg-2"
+    assert emails[0].sender == "news@store.com"
+    mock_service.users().messages().list.assert_called_once_with(
+        userId="me", q="from:news@store.com", maxResults=5
+    )
+
+
+def test_create_commercial_filter_success(mock_gmail_adapter):
+    adapter, mock_service = mock_gmail_adapter
+    mock_create = mock_service.users().settings().filters().create
+
+    adapter.create_commercial_filter("spam@junk.com")
+    mock_create.assert_called_once_with(
+        userId="me",
+        body={
+            "criteria": {"from": "spam@junk.com"},
+            "action": {"removeLabelIds": ["UNREAD", "INBOX"], "addLabelIds": ["TRASH"]},
+        },
+    )
+
+
+def test_filter_exists_true(mock_gmail_adapter):
+    adapter, mock_service = mock_gmail_adapter
+    mock_list = mock_service.users().settings().filters().list
+
+    mock_list.return_value.execute.return_value = {
+        "filter": [{"id": "filter-1", "criteria": {"from": "spam@junk.com"}}]
+    }
+
+    exists = adapter.filter_exists("spam@junk.com")
+    assert exists is True
+
+
+def test_filter_exists_false(mock_gmail_adapter):
+    adapter, mock_service = mock_gmail_adapter
+    mock_list = mock_service.users().settings().filters().list
+
+    mock_list.return_value.execute.return_value = {
+        "filter": [{"id": "filter-1", "criteria": {"from": "someone@else.com"}}]
+    }
+
+    exists = adapter.filter_exists("spam@junk.com")
+    assert exists is False

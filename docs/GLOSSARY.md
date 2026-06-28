@@ -30,3 +30,16 @@ This glossary defines the Ubiquitous Language terms used across the ZIP.AI bound
 ### LLMPort
 *   **Definition**: Outbound port defining operations to analyze and classify email content using language models.
 *   **Context**: Infrastructure Boundary.
+
+### SenderCentricWorkflow
+*   **Definition**: Paradigm of grouping inbox analysis by sender rather than individual messages, to create sender-level filters.
+*   **Context**: Inbox Processing Bounded Context.
+
+### ProcessedSendersPort
+*   **Definition**: Outbound port defining storage operations to check, load, and persist evaluated senders.
+*   **Context**: Infrastructure Boundary.
+
+### NewsletterClassification
+*   **Definition**: Binary analysis (True/False) checking if a sender's history represents newsletters or transactional messages.
+*   **Context**: LLM Categorization.
+

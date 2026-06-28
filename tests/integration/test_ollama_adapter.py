@@ -24,6 +24,8 @@ def test_ollama_classify_success(mocker):
                     "action": "delete",
                     "label_to_add": None,
                     "reason": "Phishing detection",
+                    "is_commercial": True,
+                    "confidence": 0.95,
                 }
             )
         }
@@ -54,6 +56,8 @@ def test_ollama_classify_success(mocker):
     assert result.action == EmailAction.DELETE
     assert result.label_to_add is None
     assert result.reason == "Phishing detection"
+    assert result.is_commercial is True
+    assert result.confidence == 0.95
 
     # Verify post arguments
     mock_client.post.assert_called_once()
@@ -93,3 +97,5 @@ def test_ollama_classify_http_error(mocker):
     assert result.action == EmailAction.NONE
     assert result.label_to_add is None
     assert "Failed classification due to Ollama error" in result.reason
+    assert result.is_commercial is False
+    assert result.confidence == 1.0

@@ -45,3 +45,10 @@ class ClassificationResult(BaseModel):
     reason: str = Field(
         default="", description="Reasoning explaining the classification choice"
     )
+    is_commercial: bool = Field(
+        default=False, description="True if the email is commercial or spam"
+    )
+    confidence: float = Field(
+        default=1.0,
+        description="Confidence score of classification choice between 0.0 and 1.0",
+    )

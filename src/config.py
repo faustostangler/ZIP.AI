@@ -26,6 +26,26 @@ class Settings(BaseSettings):
         description="Path to credentials.json if using file-based config",
     )
 
+    # Processed Senders settings
+    processed_senders_json_path: Path = Field(
+        default=Path("processed_senders.json"),
+        description="Path to store processed senders list",
+    )
+
+    # LLM Settings
+    llm_provider: str = Field(
+        default="ollama",
+        description="LLM provider name (e.g. 'ollama')",
+    )
+    llm_api_key: str | None = Field(
+        default=None,
+        description="Optional API key for generic LLM endpoint",
+    )
+    llm_base_url: str | None = Field(
+        default=None,
+        description="Optional base URL for generic LLM endpoint",
+    )
+
     # Ollama settings
     ollama_base_url: str = Field(
         default="http://localhost:11434",

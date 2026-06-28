@@ -70,3 +70,150 @@ def test_process_inbox_no_emails():
     mock_llm.classify_email.assert_not_called()
     mock_gmail.apply_action.assert_not_called()
     assert len(results) == 0
+
+
+def test_process_inbox_commercial_trigger_filter_creation():
+    mock_gmail = MagicMock(spec=GmailPort)
+    mock_llm = MagicMock(spec=LLMPort)
+
+    test_email = Email(
+        id="msg-1",
+        thread_id="thread-1",
+        subject="Promo",
+        sender="Shop <shop@store.com>",
+        body="Buy now",
+        received_at=datetime.now(UTC),
+        labels=["UNREAD"],
+    )
+
+    test_classification = ClassificationResult(
+        email_id="msg-1",
+        action=EmailAction.LABEL,
+        label_to_add="Commercial",
+        reason="Commercial newsletter",
+        is_commercial=True,
+        confidence=0.9,
+    )
+
+    mock_gmail.fetch_unread_emails.return_value = [test_email]
+    mock_llm.classify_email.return_value = test_classification
+    mock_gmail.filter_exists.return_value = False
+    mock_gmail.fetch_emails_by_sender.return_value = [test_email]
+    mock_llm.check_commercial_pattern.return_value = True
+
+    use_case = ProcessInboxUseCase(gmail_port=mock_gmail, llm_port=mock_llm)
+    use_case.execute()
+
+    mock_gmail.filter_exists.assert_called_once_with("shop@store.com")
+    mock_gmail.fetch_emails_by_sender.assert_called_once_with(
+        "shop@store.com", max_results=5
+    )
+    mock_llm.check_commercial_pattern.assert_called_once_with([test_email])
+    mock_gmail.create_commercial_filter.assert_called_once_with("shop@store.com")
+
+
+def test_process_inbox_commercial_filter_exists():
+    mock_gmail = MagicMock(spec=GmailPort)
+    mock_llm = MagicMock(spec=LLMPort)
+
+    test_email = Email(
+        id="msg-1",
+        thread_id="thread-1",
+        subject="Promo",
+        sender="shop@store.com",
+        body="Buy now",
+        received_at=datetime.now(UTC),
+        labels=["UNREAD"],
+    )
+
+    test_classification = ClassificationResult(
+        email_id="msg-1",
+        action=EmailAction.LABEL,
+        label_to_add="Commercial",
+        reason="Commercial newsletter",
+        is_commercial=True,
+        confidence=0.9,
+    )
+
+    mock_gmail.fetch_unread_emails.return_value = [test_email]
+    mock_llm.classify_email.return_value = test_classification
+    mock_gmail.filter_exists.return_value = True
+
+    use_case = ProcessInboxUseCase(gmail_port=mock_gmail, llm_port=mock_llm)
+    use_case.execute()
+
+    mock_gmail.filter_exists.assert_called_once_with("shop@store.com")
+    mock_gmail.fetch_emails_by_sender.assert_not_called()
+    mock_gmail.create_commercial_filter.assert_not_called()
+
+
+def test_process_inbox_commercial_low_confidence():
+    mock_gmail = MagicMock(spec=GmailPort)
+    mock_llm = MagicMock(spec=LLMPort)
+
+    test_email = Email(
+        id="msg-1",
+        thread_id="thread-1",
+        subject="Promo",
+        sender="shop@store.com",
+        body="Buy now",
+        received_at=datetime.now(UTC),
+        labels=["UNREAD"],
+    )
+
+    test_classification = ClassificationResult(
+        email_id="msg-1",
+        action=EmailAction.LABEL,
+        label_to_add="Commercial",
+        reason="Commercial newsletter",
+        is_commercial=True,
+        confidence=0.5,
+    )
+
+    mock_gmail.fetch_unread_emails.return_value = [test_email]
+    mock_llm.classify_email.return_value = test_classification
+
+    use_case = ProcessInboxUseCase(gmail_port=mock_gmail, llm_port=mock_llm)
+    use_case.execute()
+
+    mock_gmail.filter_exists.assert_not_called()
+
+
+def test_process_inbox_commercial_pattern_not_confirmed():
+    mock_gmail = MagicMock(spec=GmailPort)
+    mock_llm = MagicMock(spec=LLMPort)
+
+    test_email = Email(
+        id="msg-1",
+        thread_id="thread-1",
+        subject="Promo",
+        sender="shop@store.com",
+        body="Buy now",
+        received_at=datetime.now(UTC),
+        labels=["UNREAD"],
+    )
+
+    test_classification = ClassificationResult(
+        email_id="msg-1",
+        action=EmailAction.LABEL,
+        label_to_add="Commercial",
+        reason="Commercial newsletter",
+        is_commercial=True,
+        confidence=0.9,
+    )
+
+    mock_gmail.fetch_unread_emails.return_value = [test_email]
+    mock_llm.classify_email.return_value = test_classification
+    mock_gmail.filter_exists.return_value = False
+    mock_gmail.fetch_emails_by_sender.return_value = [test_email]
+    mock_llm.check_commercial_pattern.return_value = False
+
+    use_case = ProcessInboxUseCase(gmail_port=mock_gmail, llm_port=mock_llm)
+    use_case.execute()
+
+    mock_gmail.filter_exists.assert_called_once_with("shop@store.com")
+    mock_gmail.fetch_emails_by_sender.assert_called_once_with(
+        "shop@store.com", max_results=5
+    )
+    mock_llm.check_commercial_pattern.assert_called_once_with([test_email])
+    mock_gmail.create_commercial_filter.assert_not_called()

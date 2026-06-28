@@ -1,3 +1,4 @@
+import json
 import logging
 
 import httpx
@@ -6,24 +7,57 @@ from src.config import settings
 from src.domain.entities import ClassificationResult, Email, EmailAction
 from src.ports.llm import LLMPort
 
-logger = logging.getLogger("zip.ollama")
+logger = logging.getLogger("zip.generic_llm")
 
 
-class OllamaLLMAdapter(LLMPort):
+class GenericLLMAdapter(LLMPort):
     """
-    Adapter implementation for LLMPort that communicates with a local Ollama instance.
+    Adapter implementing LLMPort that can call either Ollama or an external generic LLM endpoint.
     """
 
     def __init__(self, client: httpx.Client | None = None) -> None:
         self.client = client or httpx.Client(timeout=30.0)
+        self.provider = settings.llm_provider.lower()
         self.base_url = settings.ollama_base_url.rstrip("/")
         self.model = settings.ollama_model
+        self.api_key = settings.llm_api_key
+
+    def _call_ollama(self, messages: list[dict], schema: dict) -> str:
+        url = f"{self.base_url}/api/chat"
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "format": schema,
+            "stream": False,
+            "options": {
+                "temperature": 0.0,
+            },
+        }
+        response = self.client.post(url, json=payload)
+        response.raise_for_status()
+        return str(response.json()["message"]["content"])
+
+    def _call_generic(self, messages: list[dict], schema: dict) -> str:
+        # Generic OpenAI-compatible chat completion endpoint
+        url = f"{settings.llm_base_url or self.base_url}/chat/completions"
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "response_format": {
+                "type": "json_object",
+                "schema": schema,
+            },
+            "temperature": 0.0,
+        }
+        response = self.client.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        return str(response.json()["choices"][0]["message"]["content"])
 
     def classify_email(self, email: Email) -> ClassificationResult:
-        """
-        Sends the email to the local Ollama model for classification.
-        Enforces structured JSON output.
-        """
         system_prompt = (
             "You are a Zero Inbox Assistant. Analyze the incoming email and decide the appropriate action.\n"
             "Actions:\n"
@@ -41,10 +75,9 @@ class OllamaLLMAdapter(LLMPort):
             f"Sender: {email.sender}\n"
             f"Subject: {email.subject}\n"
             f"Received: {email.received_at.isoformat()}\n"
-            f"Body:\n{email.body[:1500]}"  # Truncate body to fit context window comfortably
+            f"Body:\n{email.body[:1500]}"
         )
 
-        # JSON schema for Ollama structured generation
         schema = {
             "type": "object",
             "properties": {
@@ -68,57 +101,32 @@ class OllamaLLMAdapter(LLMPort):
             ],
         }
 
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "format": schema,
-            "stream": False,
-            "options": {
-                "temperature": 0.0,  # Determinstic output
-            },
-        }
-
-        url = f"{self.base_url}/api/chat"
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
         try:
-            logger.info(
-                f"Classifying email {email.id} using Ollama model '{self.model}'"
-            )
-            response = self.client.post(url, json=payload)
-            response.raise_for_status()
+            if self.provider == "ollama":
+                content = self._call_ollama(messages, schema)
+            else:
+                content = self._call_generic(messages, schema)
 
-            data = response.json()
-            message_content = data["message"]["content"]
-            logger.debug(f"Ollama raw response for {email.id}: {message_content}")
-
-            # Load the JSON result
-            result_json = ClassificationResult.model_validate_json(message_content)
-
-            # Ensure the email_id matches
+            result_json = ClassificationResult.model_validate_json(content)
             result_json.email_id = email.id
             return result_json
-
         except Exception as e:
-            logger.error(
-                f"Failed to classify email {email.id} via Ollama: {e}", exc_info=True
-            )
-            # Fail-safe fallback: keep in inbox (none) with error context
+            logger.error(f"Failed classification for {email.id}: {e}", exc_info=True)
             return ClassificationResult(
                 email_id=email.id,
                 action=EmailAction.NONE,
                 label_to_add=None,
-                reason=f"Failed classification due to Ollama error: {e!s}",
+                reason=f"Failed classification: {e!s}",
                 is_commercial=False,
                 confidence=1.0,
             )
 
     def check_commercial_pattern(self, emails: list[Email]) -> bool:
-        """
-        Verify if the list of emails from a single sender matches a commercial or spam pattern.
-        """
         if not emails:
             return False
 
@@ -142,46 +150,24 @@ class OllamaLLMAdapter(LLMPort):
             "required": ["confirmed"],
         }
 
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "format": schema,
-            "stream": False,
-            "options": {
-                "temperature": 0.0,
-            },
-        }
-
-        url = f"{self.base_url}/api/chat"
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
         try:
-            logger.info(
-                f"Checking commercial pattern for {len(emails)} emails via Ollama"
-            )
-            response = self.client.post(url, json=payload)
-            response.raise_for_status()
+            if self.provider == "ollama":
+                content = self._call_ollama(messages, schema)
+            else:
+                content = self._call_generic(messages, schema)
 
-            data = response.json()
-            message_content = data["message"]["content"]
-
-            import json
-
-            result = json.loads(message_content)
+            result = json.loads(content)
             return bool(result.get("confirmed", False))
         except Exception as e:
-            logger.error(
-                f"Failed to check commercial pattern via Ollama: {e}", exc_info=True
-            )
+            logger.error(f"Failed check_commercial_pattern: {e}", exc_info=True)
             return False
 
     def is_newsletter_sender(self, emails: list[Email]) -> bool:
-        """
-        Analyzes a list of historical emails from a single sender to determine
-        if they represent a newsletter pattern (True) or a transactional/personal one (False).
-        """
         if not emails:
             return False
 
@@ -206,37 +192,19 @@ class OllamaLLMAdapter(LLMPort):
             "required": ["is_newsletter"],
         }
 
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "format": schema,
-            "stream": False,
-            "options": {
-                "temperature": 0.0,
-            },
-        }
-
-        url = f"{self.base_url}/api/chat"
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
         try:
-            logger.info(
-                f"Checking newsletter pattern for {len(emails)} emails via Ollama"
-            )
-            response = self.client.post(url, json=payload)
-            response.raise_for_status()
+            if self.provider == "ollama":
+                content = self._call_ollama(messages, schema)
+            else:
+                content = self._call_generic(messages, schema)
 
-            data = response.json()
-            message_content = data["message"]["content"]
-
-            import json
-
-            result = json.loads(message_content)
+            result = json.loads(content)
             return bool(result.get("is_newsletter", False))
         except Exception as e:
-            logger.error(
-                f"Failed to check newsletter pattern via Ollama: {e}", exc_info=True
-            )
+            logger.error(f"Failed is_newsletter_sender check: {e}", exc_info=True)
             return False

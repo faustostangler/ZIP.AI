@@ -34,3 +34,24 @@ class GmailPort(ABC):
             label_name: Optional name of the label to apply (used if action is LABEL).
         """
         pass
+
+    @abstractmethod
+    def fetch_emails_by_sender(self, sender: str, max_results: int = 5) -> list[Email]:
+        """
+        Fetches all emails from a specific sender.
+        """
+        pass
+
+    @abstractmethod
+    def create_commercial_filter(self, sender_email: str) -> None:
+        """
+        Creates a Gmail filter to mark as read and delete emails from the sender.
+        """
+        pass
+
+    @abstractmethod
+    def filter_exists(self, sender_email: str) -> bool:
+        """
+        Checks if a filter already exists for the sender.
+        """
+        pass
