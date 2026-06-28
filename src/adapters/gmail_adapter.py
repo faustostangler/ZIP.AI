@@ -180,28 +180,39 @@ class GmailOAuthAdapter(GmailPort):
 
     def _extract_body(self, payload: dict) -> str:
         """
-        Recursively extract text/plain parts from the email message payload.
+        Recursively extract plain text or HTML fallback from the email message payload.
         """
-        body = ""
-        mime_type = payload.get("mimeType", "")
-
-        # Check if multipart payload
-        parts = payload.get("parts", [])
-        if parts:
-            for part in parts:
-                body += self._extract_body(part)
-        else:
-            # Leaf part, check if text/plain
-            if mime_type == "text/plain":
-                data = payload.get("body", {}).get("data", "")
+        def find_parts(part: dict, target_mime: str, results: list):
+            mime_type = part.get("mimeType", "")
+            if mime_type == target_mime:
+                data = part.get("body", {}).get("data", "")
                 if data:
                     try:
-                        # Decode base64url encoding typical of Gmail API body payload
-                        decoded_bytes = base64.urlsafe_b64decode(data)
-                        body += decoded_bytes.decode("utf-8", errors="ignore")
+                        decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+                        results.append(decoded)
                     except Exception as e:
-                        logger.error(f"Error decoding message body part: {e}")
-        return body
+                        logger.error(f"Error decoding body part: {e}")
+            parts = part.get("parts", [])
+            for p in parts:
+                find_parts(p, target_mime, results)
+
+        parts_list: list[str] = []
+        find_parts(payload, "text/plain", parts_list)
+        find_parts(payload, "text/html", parts_list)
+        if parts_list:
+            return "\n".join(parts_list)
+
+        # Fallback to payload body directly
+        data = payload.get("body", {}).get("data", "")
+        if data:
+            try:
+                return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+            except Exception as e:
+                logger.error(f"Error decoding root body data: {e}")
+
+        return ""
+
+
 
     def apply_action(
         self, email_id: str, action: EmailAction, label_name: str | None = None
@@ -356,27 +367,131 @@ class GmailOAuthAdapter(GmailPort):
     def create_commercial_filter(self, sender_email: str) -> None:
         """
         Creates a Gmail filter to mark as read and delete emails from the sender.
+        Consolidates into a single filter using 'OR' matching.
         """
+        import re
+
         try:
-            logger.info(f"Creating commercial filter for sender: {sender_email}")
-            filter_body = {
-                "criteria": {"from": sender_email},
-                "action": {
-                    "removeLabelIds": ["UNREAD", "INBOX"],
-                    "addLabelIds": ["TRASH"],
-                },
-            }
-            self.service.users().settings().filters().create(
-                userId="me", body=filter_body
-            ).execute()
-            logger.info(f"Successfully created filter for {sender_email}")
+            logger.info(f"Adding {sender_email} to consolidated Gmail commercial filter...")
+            results = self.service.users().settings().filters().list(userId="me").execute()
+            filters = results.get("filter", [])
         except Exception as e:
-            logger.error(f"Failed to create filter for {sender_email}: {e}")
+            logger.error(f"Failed to list filters: {e}")
+            filters = []
+
+        target_filter = None
+        for flt in filters:
+            action = flt.get("action", {})
+            add_labels = action.get("addLabelIds", [])
+            remove_labels = action.get("removeLabelIds", [])
+            if "TRASH" in add_labels and "UNREAD" in remove_labels:
+                target_filter = flt
+                break
+
+        existing_senders = set()
+        old_filter_id = None
+
+        if target_filter:
+            old_filter_id = target_filter["id"]
+            from_criteria = target_filter.get("criteria", {}).get("from", "")
+            cleaned_from = from_criteria.strip()
+            if cleaned_from.startswith("(") and cleaned_from.endswith(")"):
+                cleaned_from = cleaned_from[1:-1].strip()
+
+            parts = re.split(r"\s+[oO][rR]\s+", cleaned_from)
+            for part in parts:
+                p = part.strip().lower()
+                if p:
+                    existing_senders.add(p)
+
+        existing_senders.add(sender_email.strip().lower())
+
+        if len(existing_senders) > 1:
+            from_str = f"({' OR '.join(sorted(existing_senders))})"
+        else:
+            from_str = next(iter(existing_senders))
+
+        filter_body = {
+            "criteria": {"from": from_str},
+            "action": {
+                "removeLabelIds": ["UNREAD", "INBOX"],
+                "addLabelIds": ["TRASH"],
+            },
+        }
+
+        if old_filter_id:
+            try:
+                logger.info(f"Deleting old filter (id: {old_filter_id})...")
+                self.service.users().settings().filters().delete(
+                    userId="me", id=old_filter_id
+                ).execute()
+            except Exception as e:
+                logger.error(f"Failed to delete old filter: {e}")
+
+        try:
+            res = (
+                self.service.users()
+                .settings()
+                .filters()
+                .create(userId="me", body=filter_body)
+                .execute()
+            )
+            logger.info(f"Consolidated filter updated/created: {res}")
+        except Exception as e:
+            logger.error(f"Failed to create consolidated filter: {e}")
+
+        try:
+            logger.info(
+                f"Applying filter retroactively to all existing messages from {sender_email}..."
+            )
+            messages = []
+            next_page_token = None
+            while True:
+                results = (
+                    self.service.users()
+                    .messages()
+                    .list(userId="me", q=f"from:{sender_email}", pageToken=next_page_token)
+                    .execute()
+                )
+                messages.extend(results.get("messages", []))
+                next_page_token = results.get("nextPageToken")
+                if not next_page_token:
+                    break
+
+            if messages:
+                msg_ids = [m["id"] for m in messages]
+                logger.info(
+                    f"Moving {len(msg_ids)} existing messages from {sender_email} to TRASH..."
+                )
+                
+                # Chunk into blocks of 1000 for batchModify API constraints
+                chunk_size = 1000
+                for i in range(0, len(msg_ids), chunk_size):
+                    chunk = msg_ids[i : i + chunk_size]
+                    logger.info(f"Trashing chunk {i // chunk_size + 1} ({len(chunk)} messages)...")
+                    self.service.users().messages().batchModify(
+                        userId="me",
+                        body={
+                            "ids": chunk,
+                            "addLabelIds": ["TRASH"],
+                            "removeLabelIds": ["INBOX", "UNREAD"],
+                        },
+                    ).execute()
+                logger.info("Retroactive filter application completed successfully.")
+            else:
+                logger.info("No existing messages found to retroactively filter.")
+        except Exception as e:
+            logger.error(
+                f"Failed to apply filter retroactively for {sender_email}: {e}"
+            )
+
 
     def filter_exists(self, sender_email: str) -> bool:
         """
-        Checks if a filter already exists for the sender.
+        Checks if a filter already exists for the sender, including as part of an OR consolidated filter.
         """
+        import re
+
         try:
             results = (
                 self.service.users().settings().filters().list(userId="me").execute()
@@ -384,9 +499,16 @@ class GmailOAuthAdapter(GmailPort):
             filters = results.get("filter", [])
             for flt in filters:
                 frm = flt.get("criteria", {}).get("from", "")
-                if frm.lower() == sender_email.lower():
-                    return True
+                cleaned_frm = frm.strip()
+                if cleaned_frm.startswith("(") and cleaned_frm.endswith(")"):
+                    cleaned_frm = cleaned_frm[1:-1].strip()
+
+                parts = re.split(r"\s+[oO][rR]\s+", cleaned_frm)
+                for part in parts:
+                    if part.strip().lower() == sender_email.lower():
+                        return True
             return False
         except Exception as e:
             logger.error(f"Error checking filter existence for {sender_email}: {e}")
             return False
+

@@ -64,7 +64,7 @@ def test_use_case_newsletter_happy_path(
 
     result = use_case.execute()
 
-    assert result == "promo@store.com"
+    assert result == ["promo@store.com"]
     mock_processed_senders_port.is_processed.assert_called_once_with("promo@store.com")
     mock_gmail_port.fetch_emails_by_sender.assert_called_once_with(
         "promo@store.com", max_results=10
@@ -104,7 +104,7 @@ def test_use_case_transactional_no_filter(
 
     result = use_case.execute()
 
-    assert result == "billing@cloud.com"
+    assert result == ["billing@cloud.com"]
     # No filter should be created
     mock_gmail_port.create_commercial_filter.assert_not_called()
     # But it must be marked as processed so we don't re-evaluate
@@ -151,7 +151,7 @@ def test_use_case_skip_already_processed(
 
     result = use_case.execute()
 
-    assert result == "new@sender.com"
+    assert result == ["new@sender.com"]
     mock_processed_senders_port.mark_as_processed.assert_called_once_with(
         "new@sender.com"
     )
@@ -181,7 +181,7 @@ def test_use_case_all_senders_processed(
 
     result = use_case.execute()
 
-    assert result is None
+    assert result == []
     mock_gmail_port.fetch_emails_by_sender.assert_not_called()
     mock_llm_port.is_newsletter_sender.assert_not_called()
     mock_unsubscribe_port.unsubscribe.assert_not_called()
@@ -212,7 +212,7 @@ def test_use_case_bypass_via_unsubscribe_link(
 
     result = use_case.execute()
 
-    assert result == "promo@store.com"
+    assert result == ["promo@store.com"]
     # LLM should be bypassed
     mock_llm_port.is_newsletter_sender.assert_not_called()
     # Unsubscribe link should be called

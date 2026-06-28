@@ -76,10 +76,27 @@ class ProcessSenderCentricFiltersUseCase:
         self.unsubscribe_port = unsubscribe_port
 
     def _find_unsubscribe_link(self, body: str) -> str | None:
-        # Find all URLs in the body
-        urls = re.findall(r'https?://[^\s<>"]+', body)
+        body_lower = body.lower()
 
-        # First pass: check if any URL itself contains unsubscribe-like keywords
+        # 1. Keywords to search for
+        keywords = [
+            "unsubscribe",
+            "opt-out",
+            "opt out",
+            "descadastrar",
+            "desinscrever",
+            "cancelar inscrição",
+            "cancelar inscricao",
+            "cancelar assinatura",
+            "sair da lista",
+        ]
+
+        # Check if any keyword is in the body
+        if not any(kw in body_lower for kw in keywords):
+            return None
+
+        # 2. Try to find a URL that contains unsubscribe keywords inside the URL itself
+        urls = re.findall(r'https?://[^\s<>"]+', body)
         unsub_url_keywords = [
             "unsubscribe",
             "unsub",
@@ -94,76 +111,90 @@ class ProcessSenderCentricFiltersUseCase:
             if any(kw in url_lower for kw in unsub_url_keywords):
                 return url
 
-        # Second pass: check if body contains unsubscribe keywords, and if so, check if we have any URL
-        body_lower = body.lower()
-        body_keywords = [
-            "unsubscribe",
-            "opt out",
-            "opt-out",
-            "desinscrever",
-            "descadastrar",
-            "cancelar inscrição",
-            "cancelar inscricao",
-        ]
-        if any(kw in body_lower for kw in body_keywords) and urls:
-            # Return the last URL, as unsubscribe links are usually at the bottom of the email
+        # 3. Look for a URL that is close to the keyword in the text (proximity match within 150 chars)
+        for kw in keywords:
+            # Match keyword followed by text, then URL
+            pattern_after = re.compile(
+                rf"{re.escape(kw)}[\s\S]{{0,150}}?(https?://[^\s<>\"\u200b]+)",
+                re.IGNORECASE,
+            )
+            match = pattern_after.search(body)
+            if match:
+                return match.group(1).rstrip(".,;)]}>")
+
+            # Match URL followed by text, then keyword
+            pattern_before = re.compile(
+                rf"(https?://[^\s<>\"\u200b]+)[\s\S]{{0,150}}?{re.escape(kw)}",
+                re.IGNORECASE,
+            )
+            match = pattern_before.search(body)
+            if match:
+                return match.group(1).rstrip(".,;)]}>")
+
+        # 4. Fallback: if keywords exist in the body, but no direct proximity match, return the last URL
+        if urls:
             return urls[-1]
 
         return None
 
-    def execute(self) -> str | None:
+    def execute(self) -> list[str]:
         """
         Coordinates the workflow:
-        1. Fetch unread or recent messages in the inbox.
-        2. Identify the first sender that has not yet been processed locally.
-        3. Retrieve history (all past messages) from that sender.
-        4. Check for unsubscribe links in email bodies. If found, request link and bypass LLM.
-        5. Otherwise, classify sender via AI (Newsletter vs Transactional).
-        6. If newsletter, create filter in Gmail to route messages directly to trash.
-        7. Persist sender state as processed.
+        1. Fetch unread messages in the inbox.
+        2. Identify unprocessed senders message-by-message.
+        3. For each unseen sender, retrieve history and process them.
+        4. If unsubscribe link found, request it and bypass LLM. Otherwise, classify via LLM.
+        5. If newsletter, create filter in Gmail to route messages directly to trash.
+        6. Persist sender state as processed.
 
         Returns:
-            The processed sender email address, or None if no unseen sender was found.
+            The list of processed sender email addresses.
         """
         # Fetch unread emails to inspect latest senders
-        emails = self.gmail_port.fetch_unread_emails(max_results=50)
-        target_sender = None
+        emails = self.gmail_port.fetch_unread_emails(max_results=100)
+        processed_senders = []
+        processed_set = set()
 
         for email in emails:
             _, sender_email = parseaddr(email.sender)
             if not sender_email:
                 continue
             sender_email = sender_email.strip().lower()
-            if not self.processed_senders_port.is_processed(sender_email):
-                target_sender = sender_email
-                break
 
-        if not target_sender:
-            return None
+            # Skip if already processed in this batch or globally
+            if (
+                sender_email in processed_set
+                or self.processed_senders_port.is_processed(sender_email)
+            ):
+                continue
 
-        # Fetch history for this sender
-        history = self.gmail_port.fetch_emails_by_sender(target_sender, max_results=10)
+            # Fetch history for this sender
+            history = self.gmail_port.fetch_emails_by_sender(
+                sender_email, max_results=10
+            )
 
-        # Scan history for unsubscribe links
-        unsub_link = None
-        for email in history:
-            link = self._find_unsubscribe_link(email.body)
-            if link:
-                unsub_link = link
-                break
+            # Scan history for unsubscribe links
+            unsub_link = None
+            for hist_email in history:
+                link = self._find_unsubscribe_link(hist_email.body)
+                if link:
+                    unsub_link = link
+                    break
 
-        is_newsletter = False
-        if unsub_link:
-            # Attempt to request unsubscribe link, bypassing LLM
-            self.unsubscribe_port.unsubscribe(unsub_link)
-            is_newsletter = True
-        else:
-            is_newsletter = self.llm_port.is_newsletter_sender(history)
+            is_newsletter = False
+            if unsub_link:
+                # Attempt to request unsubscribe link, bypassing LLM
+                self.unsubscribe_port.unsubscribe(unsub_link)
+                is_newsletter = True
+            else:
+                is_newsletter = self.llm_port.is_newsletter_sender(history)
 
-        if is_newsletter:
-            self.gmail_port.create_commercial_filter(target_sender)
+            if is_newsletter:
+                self.gmail_port.create_commercial_filter(sender_email)
 
-        # Mark sender as processed in local storage
-        self.processed_senders_port.mark_as_processed(target_sender)
+            # Mark sender as processed in local storage and memory
+            self.processed_senders_port.mark_as_processed(sender_email)
+            processed_set.add(sender_email)
+            processed_senders.append(sender_email)
 
-        return target_sender
+        return processed_senders

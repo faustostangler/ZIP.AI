@@ -112,12 +112,48 @@ def find_unseen_sender(service, processed_list):
             
     return None, None
 
+def extract_body(payload: dict) -> str:
+    # Helper to recursively find parts by MIME type
+    def find_parts(part: dict, target_mime: str, results: list):
+        mime_type = part.get("mimeType", "")
+        if mime_type == target_mime:
+            data = part.get("body", {}).get("data", "")
+            if data:
+                try:
+                    import base64
+                    decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+                    results.append(decoded)
+                except Exception:
+                    pass
+        parts = part.get("parts", [])
+        for p in parts:
+            find_parts(p, target_mime, results)
+
+    # 1. Try to find all text/plain and text/html parts
+    parts_list = []
+    find_parts(payload, "text/plain", parts_list)
+    find_parts(payload, "text/html", parts_list)
+    if parts_list:
+        return "\n".join(parts_list)
+        
+    # 2. Fallback to payload body if present
+    data = payload.get("body", {}).get("data", "")
+    if data:
+        try:
+            import base64
+            return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+            
+    return ""
+
 def fetch_sender_history(service, email_addr):
     print(f"Fetching history for {email_addr}...")
     results = service.users().messages().list(userId="me", q=f"from:{email_addr}", maxResults=5).execute()
     messages = results.get("messages", [])
     
     history = []
+    unsub_link = None
     for msg in messages:
         detail = service.service.users().messages().get(userId="me", id=msg["id"], format="full").execute() if hasattr(service, "service") else service.users().messages().get(userId="me", id=msg["id"], format="full").execute()
         headers = detail.get("payload", {}).get("headers", [])
@@ -127,27 +163,23 @@ def fetch_sender_history(service, email_addr):
                 subject = h.get("value", "")
                 break
         
-        # Simple body extract
-        body = ""
-        payload = detail.get("payload", {})
-        parts = payload.get("parts", [])
-        if parts:
-            for part in parts:
-                if part.get("mimeType") == "text/plain":
-                    data = part.get("body", {}).get("data", "")
-                    if data:
-                        body = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-                        break
-        else:
-            data = payload.get("body", {}).get("data", "")
-            if data:
-                body = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+        # Robust body extract (handles parts, text/plain, text/html, and single-part html)
+        body = extract_body(detail.get("payload", {}))
                 
         history.append({
             "subject": subject,
-            "body": body[:200]  # truncate
+            "body": body
         })
-    return history
+
+        # Early check for unsubscribe link to save API quota
+        link = find_unsubscribe_link(body)
+        if link:
+            unsub_link = link
+            print("Found unsubscribe link. Interrupting history fetch early to save API quota.")
+            break
+            
+    return history, unsub_link
+
 
 def classify_sender(env, email_addr, history):
     print(f"Classifying sender {email_addr} using Ollama...")
@@ -156,7 +188,7 @@ def classify_sender(env, email_addr, history):
     
     history_str = ""
     for idx, item in enumerate(history, 1):
-        history_str += f"Email {idx}:\nSubject: {item['subject']}\nBody: {item['body']}\n\n"
+        history_str += f"Email {idx}:\nSubject: {item['subject']}\nBody: {item['body'][:1500]}\n\n"
         
     system_prompt = (
         "You are an email analysis bot. Analyze the sender's history and decide if the sender is a Newsletter "
@@ -188,103 +220,334 @@ def classify_sender(env, email_addr, history):
             "temperature": 0.0
         }
     }
-    
+    import time
+    start_time = time.perf_counter()
     try:
-        r = httpx.post(f"{ollama_url}/api/chat", json=payload, timeout=30.0)
+        r = httpx.post(f"{ollama_url}/api/chat", json=payload, timeout=600.0)
         r.raise_for_status()
+        duration = time.perf_counter() - start_time
         data = r.json()
         content = data["message"]["content"]
         result = json.loads(content)
         is_newsletter = result.get("is_newsletter", False)
-        print(f"LLM Decision: is_newsletter = {is_newsletter} (raw output: {content})")
+        print(f"LLM Decision: is_newsletter = {is_newsletter} (took {duration:.2f}s) (raw output: {content})")
         return is_newsletter
     except Exception as e:
-        print(f"Error calling LLM: {e}")
+        duration = time.perf_counter() - start_time
+        print(f"Error calling LLM after {duration:.2f}s: {e}")
         return False
 
 def create_gmail_filter(service, email_addr):
-    print(f"Creating Gmail filter for {email_addr} to trash future messages...")
+    print(f"Adding {email_addr} to consolidated Gmail commercial filter...")
+    
+    # 1. Fetch all filters
+    try:
+        results = service.users().settings().filters().list(userId="me").execute()
+        filters = results.get("filter", [])
+    except Exception as e:
+        print(f"Error listing filters: {e}")
+        filters = []
+        
+    target_filter = None
+    # Look for the consolidated filter: action contains TRASH and skips inbox
+    for flt in filters:
+        action = flt.get("action", {})
+        add_labels = action.get("addLabelIds", [])
+        remove_labels = action.get("removeLabelIds", [])
+        if "TRASH" in add_labels and "UNREAD" in remove_labels:
+            target_filter = flt
+            break
+            
+    existing_senders = set()
+    old_filter_id = None
+    
+    if target_filter:
+        old_filter_id = target_filter["id"]
+        from_criteria = target_filter.get("criteria", {}).get("from", "")
+        # Clean up parentheses
+        cleaned_from = from_criteria.strip()
+        if cleaned_from.startswith("(") and cleaned_from.endswith(")"):
+            cleaned_from = cleaned_from[1:-1].strip()
+            
+        # Parse existing emails
+        # Split by " OR " case-insensitively
+        import re
+        parts = re.split(r'\s+[oO][rR]\s+', cleaned_from)
+        for part in parts:
+            p = part.strip().lower()
+            if p:
+                existing_senders.add(p)
+                
+    # Add new email address to set
+    existing_senders.add(email_addr.strip().lower())
+    
+    # Format the new criteria from string
+    if len(existing_senders) > 1:
+        from_str = f"({' OR '.join(sorted(existing_senders))})"
+    else:
+        from_str = next(iter(existing_senders))
+        
     filter_body = {
-        "criteria": {"from": email_addr},
+        "criteria": {"from": from_str},
         "action": {
             "removeLabelIds": ["UNREAD", "INBOX"],
             "addLabelIds": ["TRASH"]
         }
     }
+    
+    # Delete the old filter if it exists
+    if old_filter_id:
+        try:
+            print(f"Deleting old filter (id: {old_filter_id})...")
+            service.users().settings().filters().delete(userId="me", id=old_filter_id).execute()
+        except Exception as e:
+            print(f"Error deleting old filter: {e}")
+            
+    # Create the new updated filter
     try:
         res = service.users().settings().filters().create(userId="me", body=filter_body).execute()
-        print(f"Filter created: {res}")
+        print(f"Consolidated filter updated/created successfully: {res}")
     except Exception as e:
-        print(f"Error creating filter: {e}")
+        print(f"Error creating updated filter: {e}")
+
+    # Retroactively trash all existing emails from the new sender
+    try:
+        print(f"Applying filter retroactively to all existing messages from {email_addr}...")
+        messages = []
+        next_page_token = None
+        while True:
+            results = service.users().messages().list(
+                userId="me", q=f"from:{email_addr}", pageToken=next_page_token
+            ).execute()
+            messages.extend(results.get("messages", []))
+            next_page_token = results.get("nextPageToken")
+            if not next_page_token:
+                break
+
+        if messages:
+            msg_ids = [m["id"] for m in messages]
+            print(f"Moving {len(msg_ids)} existing messages to trash...")
+            
+            # Chunk into blocks of 1000 for batchModify API constraints
+            chunk_size = 1000
+            for i in range(0, len(msg_ids), chunk_size):
+                chunk = msg_ids[i:i + chunk_size]
+                print(f"Trashing chunk {i // chunk_size + 1} ({len(chunk)} messages)...")
+                service.users().messages().batchModify(
+                    userId="me",
+                    body={
+                        "ids": chunk,
+                        "addLabelIds": ["TRASH"],
+                        "removeLabelIds": ["INBOX", "UNREAD"]
+                    }
+                ).execute()
+            print("Retroactive filter application completed.")
+        else:
+            print("No existing messages found to retroactively filter.")
+    except Exception as e:
+        print(f"Error applying filter retroactively: {e}")
+
+
 
 def find_unsubscribe_link(body: str) -> str | None:
     import re
-    # Find all URLs in the body
-    urls = re.findall(r'https?://[^\s<>"]+', body)
+    import unicodedata
     
-    # First pass: check if any URL itself contains unsubscribe-like keywords
+    # Normalize body to lower-case ASCII without diacritics/accents
+    body_normalized = unicodedata.normalize('NFKD', body).encode('ASCII', 'ignore').decode('ASCII').lower()
+    
+    # 1. Keywords to search for (normalized to lowercase without accents)
+    keywords = [
+        "unsubscribe", "opt-out", "opt out", "descadastrar", 
+        "descadastre", "desinscrever", "desinscreva", "cancelar inscricao", 
+        "cancelar assinatura", "sair da lista",
+        "nao queira mais receber",
+        "nao deseja mais receber",
+        "nao deseja",
+        "nao desejar mais receber",
+        "nao receber mais",
+        "deixar de receber", "parar de receber",
+        "preferencias de envio",
+        "gerenciar preferencias",
+        "remover de nossa lista", "remover seu e-mail", "remover seu email",
+        "caso nao queira"
+    ]
+    
+    # Check if any keyword is in the normalized body
+    if not any(kw in body_normalized for kw in keywords):
+        return None
+        
+    # 2. Try to find a URL that contains unsubscribe keywords inside the URL itself
+    urls = re.findall(r'https?://[^\s<>"]+', body_normalized)
     unsub_url_keywords = ["unsubscribe", "unsub", "optout", "opt-out", "descadastrar", "desinscrever", "cancelar"]
     for url in urls:
         url_lower = url.lower()
         if any(kw in url_lower for kw in unsub_url_keywords):
             return url
             
-    # Second pass: check if body contains unsubscribe keywords, and if so, check if we have any URL
-    body_lower = body.lower()
-    body_keywords = ["unsubscribe", "opt out", "opt-out", "desinscrever", "descadastrar", "cancelar inscrição", "cancelar inscricao"]
-    if any(kw in body_lower for kw in body_keywords) and urls:
-        # Return the last URL, as unsubscribe links are usually at the bottom of the email
+    # 3. Look for a URL that is close to the keyword in the text (proximity match within 300 chars)
+    for kw in keywords:
+        # Match keyword followed by text, then URL
+        pattern_after = re.compile(
+            rf"{re.escape(kw)}[\s\S]{{0,300}}?(https?://[^\s<>\"\u200b]+)", re.IGNORECASE
+        )
+        match = pattern_after.search(body_normalized)
+        if match:
+            return match.group(1).rstrip(".,;)]}>")
+
+        # Match URL followed by text, then keyword
+        pattern_before = re.compile(
+            rf"(https?://[^\s<>\"\u200b]+)[\s\S]{{0,300}}?{re.escape(kw)}", re.IGNORECASE
+        )
+        match = pattern_before.search(body_normalized)
+        if match:
+            return match.group(1).rstrip(".,;)]}>")
+
+    # 4. Fallback: if keywords exist in the body, but no direct proximity match, return the last URL
+    if urls:
         return urls[-1]
         
     return None
 
+def input_with_timeout(prompt: str, timeout: float = 5.0, default: str = "y") -> str:
+    import sys
+    import select
+    print(prompt, end="", flush=True)
+    rlist, _, _ = select.select([sys.stdin], [], [], timeout)
+    if rlist:
+        val = sys.stdin.readline().strip().lower()
+        return val if val else default
+    else:
+        print(f"\n[Timeout] Auto-selecting default: {default}")
+        return default
 def main():
     print("Starting Sandbox Spike...")
     env = load_env()
     service = get_gmail_service(env)
     
     processed_list = load_processed_senders()
-    print(f"Loaded processed list: {processed_list}")
+    processed_set = set(processed_list)
+    print(f"Loaded processed list with {len(processed_set)} senders.")
     
-    email_addr, raw_from = find_unseen_sender(service, processed_list)
-    if not email_addr:
-        print("No unseen senders found in latest messages.")
-        return
+    next_page_token = None
+    evaluated_messages_count = 0
+    processed_senders_count = 0
+    
+    print("Starting message-by-message inbox analysis...")
+    while True:
+        print(f"Fetching page of inbox messages (token: {next_page_token})...")
+        try:
+            results = service.users().messages().list(
+                userId="me", 
+                q="label:INBOX", 
+                maxResults=50, 
+                pageToken=next_page_token
+            ).execute()
+        except Exception as e:
+            print(f"Error listing messages: {e}")
+            break
+            
+        messages = results.get("messages", [])
+        next_page_token = results.get("nextPageToken")
         
-    history = fetch_sender_history(service, email_addr)
-    print(f"Fetched {len(history)} messages from sender history.")
-    
-    # Check for unsubscribe links in the history
-    unsub_link = None
-    for email in history:
-        link = find_unsubscribe_link(email["body"])
-        if link:
-            unsub_link = link
+        if not messages:
+            print("No more messages in INBOX.")
+            break
+            
+        print(f"Fetching metadata for {len(messages)} messages using Gmail API Batch Request...")
+        senders_map = {}
+        
+        def batch_callback(request_id, response, exception):
+            if exception is not None:
+                return
+            msg_id = response.get("id")
+            headers = response.get("payload", {}).get("headers", [])
+            for h in headers:
+                if h.get("name", "").lower() == "from":
+                    senders_map[msg_id] = h.get("value", "")
+                    break
+                    
+        batch = service.new_batch_http_request(callback=batch_callback)
+        for msg in messages:
+            batch.add(service.users().messages().get(
+                userId="me",
+                id=msg["id"],
+                format="metadata",
+                metadataHeaders=["From"]
+            ))
+            
+        try:
+            batch.execute()
+        except Exception as e:
+            print(f"Error executing batch request: {e}")
             break
 
-    is_newsletter = False
-    if unsub_link:
-        print(f"Unsubscribe link found: {unsub_link}")
-        try:
-            print("Attempting to unsubscribe by opening link...")
-            # Make a GET request to the unsubscribe link
-            r = httpx.get(unsub_link, timeout=10.0, follow_redirects=True)
-            print(f"Unsubscribe request status code: {r.status_code}")
-        except Exception as e:
-            print(f"Failed to request unsubscribe link: {e}")
-        
-        # Bypass LLM: mark as newsletter directly
-        is_newsletter = True
-    else:
-        is_newsletter = classify_sender(env, email_addr, history)
-    
-    if is_newsletter:
-        create_gmail_filter(service, email_addr)
-    else:
-        print(f"Sender {email_addr} is transactional. No filter created.")
-        
-    save_processed_sender(email_addr)
-    print("Sandbox Spike completed successfully!")
+        for msg in messages:
+            msg_id = msg["id"]
+            evaluated_messages_count += 1
+            
+            from_val = senders_map.get(msg_id)
+            if not from_val:
+                continue
+                
+            email_addr = from_val
+            if "<" in from_val and ">" in from_val:
+                email_addr = from_val.split("<")[1].split(">")[0]
+            email_addr = email_addr.strip().lower()
+            
+            # Skip if already processed in this run or historically
+            if email_addr in processed_set:
+                continue
+                
+            # We found a new unprocessed sender!
+            print(f"\n==========================================")
+            print(f"Processing new sender: {email_addr} (From: {from_val})")
+            
+            history, unsub_link = fetch_sender_history(service, email_addr)
+            print(f"Fetched {len(history)} messages from sender history.")
+
+            is_newsletter = False
+            if unsub_link:
+                print(f"Unsubscribe link found: {unsub_link}")
+                
+                # Query user with 1 second timeout
+                prompt_str = f"Do you want to unsubscribe from '{email_addr}'? [Y/n] (Auto-yes in 1s): "
+                choice = input_with_timeout(prompt_str, timeout=1.0, default="y")
+                
+                if choice in ("y", "yes"):
+                    try:
+                        print("Attempting to unsubscribe by opening link...")
+                        # Make a GET request to the unsubscribe link
+                        r = httpx.get(unsub_link, timeout=10.0, follow_redirects=True)
+                        print(f"Unsubscribe request status code: {r.status_code}")
+                    except Exception as e:
+                        print(f"Failed to request unsubscribe link: {e}")
+                else:
+                    print("Skipped automated unsubscribe request.")
+                
+                # Bypass LLM: mark as newsletter directly
+                is_newsletter = True
+            else:
+                is_newsletter = classify_sender(env, email_addr, history)
+                # is_newsletter = False
+                # print("Temporarily classified as transactional")
+            
+            if is_newsletter:
+                create_gmail_filter(service, email_addr)
+            else:
+                print(f"Sender {email_addr} is transactional. No filter created.")
+                
+            if is_newsletter:
+                save_processed_sender(email_addr)
+
+            processed_set.add(email_addr)
+            processed_senders_count += 1
+            
+        if not next_page_token:
+            print("Reached the end of the INBOX (no nextPageToken).")
+            break
+            
+    print(f"\nSandbox Spike completed. Evaluated {evaluated_messages_count} messages, processed {processed_senders_count} new senders.")
 
 if __name__ == "__main__":
     main()
