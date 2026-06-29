@@ -599,9 +599,16 @@ def get_or_create_label(service, label_name):
 
 
 def create_gmail_category_filter(service, email_addr, category):
-    # Capitalize label name
-    label_name = category.capitalize()
-    print(f"Adding {email_addr} to consolidated Gmail category filter: {label_name}...")
+    # Capitalize label name and prepend prefix
+    label_name = f"Gemini/{category.capitalize()}"
+    
+    # Determine if we should archive (remove from INBOX) for this category
+    should_archive = category.lower() not in {"personal", "profissional", "other"}
+    
+    if should_archive:
+        print(f"Adding {email_addr} to consolidated Gmail category filter: {label_name} (with Inbox archiving)...")
+    else:
+        print(f"Adding {email_addr} to consolidated Gmail category filter: {label_name} (keeping in Inbox)...")
     
     # 0. Get or create label ID
     label_id = get_or_create_label(service, label_name)
@@ -618,14 +625,18 @@ def create_gmail_category_filter(service, email_addr, category):
         filters = []
         
     target_filter = None
-    # Look for the consolidated filter: action contains this category's label_id and removes from INBOX
+    # Look for the consolidated filter: matches label_id and the expected inbox archiving action
     for flt in filters:
         action = flt.get("action", {})
         add_labels = action.get("addLabelIds", [])
         remove_labels = action.get("removeLabelIds", [])
-        if label_id in add_labels and "INBOX" in remove_labels:
-            target_filter = flt
-            break
+        if label_id in add_labels:
+            if should_archive and "INBOX" in remove_labels:
+                target_filter = flt
+                break
+            elif not should_archive and "INBOX" not in remove_labels:
+                target_filter = flt
+                break
             
     existing_senders = set()
     old_filter_id = None
@@ -655,13 +666,21 @@ def create_gmail_category_filter(service, email_addr, category):
     else:
         from_str = next(iter(existing_senders))
         
-    filter_body = {
-        "criteria": {"from": from_str},
-        "action": {
-            "removeLabelIds": ["INBOX"],
-            "addLabelIds": [label_id]
+    if should_archive:
+        filter_body = {
+            "criteria": {"from": from_str},
+            "action": {
+                "removeLabelIds": ["INBOX"],
+                "addLabelIds": [label_id]
+            }
         }
-    }
+    else:
+        filter_body = {
+            "criteria": {"from": from_str},
+            "action": {
+                "addLabelIds": [label_id]
+            }
+        }
     
     # Delete the old filter if it exists
     if old_filter_id:
@@ -694,18 +713,26 @@ def create_gmail_category_filter(service, email_addr, category):
                 
         if messages:
             msg_ids = [m["id"] for m in messages]
-            print(f"Adding label '{label_name}' and removing from INBOX for {len(msg_ids)} existing messages...")
+            if should_archive:
+                print(f"Adding label '{label_name}' and removing from INBOX for {len(msg_ids)} existing messages...")
+                remove_ids = ["INBOX"]
+            else:
+                print(f"Adding label '{label_name}' to {len(msg_ids)} existing messages (keeping in INBOX)...")
+                remove_ids = []
             
             chunk_size = 1000
             for i in range(0, len(msg_ids), chunk_size):
                 chunk = msg_ids[i:i + chunk_size]
+                body = {
+                    "ids": chunk,
+                    "addLabelIds": [label_id]
+                }
+                if remove_ids:
+                    body["removeLabelIds"] = remove_ids
+                    
                 service.users().messages().batchModify(
                     userId="me",
-                    body={
-                        "ids": chunk,
-                        "addLabelIds": [label_id],
-                        "removeLabelIds": ["INBOX"]
-                    }
+                    body=body
                 ).execute()
             print("Retroactive filter application completed.")
         else:
@@ -732,6 +759,7 @@ def find_unsubscribe_link(body: str) -> str | None:
         "nao deseja",
         "nao desejar mais receber",
         "nao receber mais",
+        "nao quero receber",
         "deixar de receber", "parar de receber",
         "preferencias de envio",
         "gerenciar preferencias",
@@ -786,6 +814,81 @@ def input_with_timeout(prompt: str, timeout: float = 5.0, default: str = "y") ->
     else:
         print(f"\n[Timeout] Auto-selecting default: {default}")
         return default
+
+def classify_sender_ollama(email_addr, history):
+    print(f"Classifying sender {email_addr} using Ollama (gemma4:12b)...")
+    import json
+    import httpx
+    
+    # Format the email history prompt
+    history_str = ""
+    for idx, item in enumerate(history, 1):
+        history_str += f"Email {idx}:\nSubject: {item['subject']}\nBody: {item['body'][:1200]}\n\n"
+        
+    prompt_text = (
+        "You are an email analysis bot. Analyze the sender's history and determine:\n"
+        "1. If the sender is a Newsletter (automatic promotions, marketing, newsletters, content digests, subscriptions).\n"
+        "2. If it is NOT a newsletter, classify it into exactly ONE of the following categories:\n"
+        "   - 'personal': Direct human-to-human conversations or personal direct messages.\n"
+        "   - 'profissional': Emails related to work, business, or professional activities.\n"
+        "   - 'transactional': Invoices, billing, order tracking, purchase confirmations, or financial statements.\n"
+        "   - 'security': Password resets, login alerts, 2FA verification codes, or access authorizations.\n"
+        "   - 'notification': Calendar invites, system updates, social media notifications, or collaboration pings (Jira, Slack, GitHub).\n"
+        "   - 'other': Emails that do not fall into any of the above categories.\n\n"
+        "Return a JSON object conforming exactly to this schema:\n"
+        "{\n"
+        "  \"is_newsletter\": boolean,\n"
+        "  \"category\": string\n"
+        "}\n\n"
+        f"Sender: {email_addr}\nHistory:\n{history_str}"
+    )
+    
+    payload = {
+        "model": "qwen2.5:7b", # "qwen2.5-coder:7b" # "gemma4:12b",
+        "prompt": prompt_text,
+        "format": "json",
+        "stream": False,
+        "options": {
+            "temperature": 0.0
+        }
+    }
+    
+    import time
+    start_time = time.perf_counter()
+    
+    # 5-minute timeout for local Ollama run
+    r = httpx.post("http://localhost:11434/api/generate", json=payload, timeout=300.0)
+    r.raise_for_status()
+    
+    duration = time.perf_counter() - start_time
+    res_json = r.json()
+    response_text = res_json.get("response", "")
+    
+    parsed_json = json.loads(response_text)
+    is_newsletter = parsed_json.get("is_newsletter", False)
+    category = parsed_json.get("category", "other")
+    
+    category = category.strip().lower()
+    if is_newsletter:
+        category = "newsletter"
+        
+    # Extract Ollama performance metrics
+    total_duration = res_json.get("total_duration", 0) / 1e9
+    load_duration = res_json.get("load_duration", 0) / 1e9
+    prompt_eval_count = res_json.get("prompt_eval_count", 0)
+    prompt_eval_duration = res_json.get("prompt_eval_duration", 0) / 1e9
+    eval_count = res_json.get("eval_count", 0)
+    eval_duration = res_json.get("eval_duration", 0) / 1e9
+    tokens_per_sec = eval_count / eval_duration if eval_duration > 0 else 0
+    
+    print(
+        f"[Ollama] Decision: is_newsletter = {is_newsletter}, category = {category}\n"
+        f"  - Total Time: {duration:.2f}s (Ollama API: {total_duration:.2f}s, Load: {load_duration:.2f}s, Prompt Eval: {prompt_eval_duration:.2f}s, Gen: {eval_duration:.2f}s)\n"
+        f"  - Tokens: Prompt = {prompt_eval_count}, Response = {eval_count}\n"
+        f"  - Generation Speed: {tokens_per_sec:.2f} tokens/sec"
+    )
+    return is_newsletter, category
+
 
 def main():
     print("Starting Sandbox Spike...")
@@ -902,7 +1005,12 @@ def main():
                     is_newsletter = True
                     category = "newsletter"
                 else:
-                    is_newsletter, category = classifier.classify(email_addr, history)
+                    try:
+                        is_newsletter, category = classify_sender_ollama(email_addr, history)
+                    except Exception as ollama_error:
+                        print(f"Ollama classification failed or timed out: {ollama_error}")
+                        print("Falling back to Gemini Web (Playwright)...")
+                        is_newsletter, category = classifier.classify(email_addr, history)
                 
                 if is_newsletter:
                     # Newsletters go to trash consolidated filter
