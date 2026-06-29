@@ -816,7 +816,8 @@ def input_with_timeout(prompt: str, timeout: float = 5.0, default: str = "y") ->
         return default
 
 def classify_sender_ollama(email_addr, history):
-    print(f"Classifying sender {email_addr} using Ollama (gemma4:12b)...")
+    model = "qwen2.5:7b" # "qwen2.5-coder:7b" # "gemma4:12b",
+    print(f"Classifying sender {email_addr} using Ollama ({model})...")
     import json
     import httpx
     
@@ -842,9 +843,8 @@ def classify_sender_ollama(email_addr, history):
         "}\n\n"
         f"Sender: {email_addr}\nHistory:\n{history_str}"
     )
-    
     payload = {
-        "model": "qwen2.5:7b", # "qwen2.5-coder:7b" # "gemma4:12b",
+        "model": model,
         "prompt": prompt_text,
         "format": "json",
         "stream": False,
