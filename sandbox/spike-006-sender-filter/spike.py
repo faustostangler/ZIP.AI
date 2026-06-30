@@ -461,6 +461,35 @@ class GeminiWebClassifier:
         if self.playwright:
             self.playwright.stop()
 
+def chunk_senders(senders: set[str], max_len: int = 1000) -> list[str]:
+    # Returns a list of criteria strings, each formatted as (email1 OR email2 OR ...)
+    sorted_senders = sorted(list(senders))
+    chunks = []
+    current_chunk = []
+    current_len = 0
+    for sender in sorted_senders:
+        added_len = len(sender)
+        if not current_chunk:
+            new_len = added_len + 2  # (sender)
+        else:
+            new_len = current_len + 4 + added_len  # ... OR sender)
+            
+        if new_len > max_len and current_chunk:
+            chunks.append(f"({' OR '.join(current_chunk)})")
+            current_chunk = [sender]
+            current_len = len(sender) + 2
+        else:
+            current_chunk.append(sender)
+            current_len = new_len
+            
+    if current_chunk:
+        if len(current_chunk) > 1:
+            chunks.append(f"({' OR '.join(current_chunk)})")
+        else:
+            chunks.append(current_chunk[0])
+    return chunks
+
+
 def create_gmail_filter(service, email_addr):
     print(f"Adding {email_addr} to consolidated Gmail commercial filter...")
     
@@ -472,29 +501,25 @@ def create_gmail_filter(service, email_addr):
         print(f"Error listing filters: {e}")
         filters = []
         
-    target_filter = None
-    # Look for the consolidated filter: action contains TRASH and skips inbox
+    target_filters = []
+    # Find all existing consolidated filters that match the TRASH and UNREAD criteria and are 'from' filters
     for flt in filters:
         action = flt.get("action", {})
         add_labels = action.get("addLabelIds", [])
         remove_labels = action.get("removeLabelIds", [])
-        if "TRASH" in add_labels and "UNREAD" in remove_labels:
-            target_filter = flt
-            break
+        if "TRASH" in add_labels and "UNREAD" in remove_labels and "from" in flt.get("criteria", {}):
+            target_filters.append(flt)
             
     existing_senders = set()
-    old_filter_id = None
+    old_filter_ids = []
     
-    if target_filter:
-        old_filter_id = target_filter["id"]
-        from_criteria = target_filter.get("criteria", {}).get("from", "")
-        # Clean up parentheses
+    for flt in target_filters:
+        old_filter_ids.append(flt["id"])
+        from_criteria = flt.get("criteria", {}).get("from", "")
         cleaned_from = from_criteria.strip()
         if cleaned_from.startswith("(") and cleaned_from.endswith(")"):
             cleaned_from = cleaned_from[1:-1].strip()
             
-        # Parse existing emails
-        # Split by " OR " case-insensitively
         import re
         parts = re.split(r'\s+[oO][rR]\s+', cleaned_from)
         for part in parts:
@@ -503,36 +528,66 @@ def create_gmail_filter(service, email_addr):
                 existing_senders.add(p)
                 
     # Add new email address to set
-    existing_senders.add(email_addr.strip().lower())
-    
-    # Format the new criteria from string
-    if len(existing_senders) > 1:
-        from_str = f"({' OR '.join(sorted(existing_senders))})"
-    else:
-        from_str = next(iter(existing_senders))
+    new_sender = email_addr.strip().lower()
+    if new_sender in existing_senders:
+        print(f"Sender {new_sender} already exists in consolidated filter. No changes needed.")
+        return
         
-    filter_body = {
-        "criteria": {"from": from_str},
-        "action": {
-            "removeLabelIds": ["UNREAD", "INBOX"],
-            "addLabelIds": ["TRASH"]
-        }
-    }
+    existing_senders.add(new_sender)
     
-    # Delete the old filter if it exists
-    if old_filter_id:
-        try:
-            print(f"Deleting old filter (id: {old_filter_id})...")
-            service.users().settings().filters().delete(userId="me", id=old_filter_id).execute()
-        except Exception as e:
-            print(f"Error deleting old filter: {e}")
-            
-    # Create the new updated filter
-    try:
-        res = service.users().settings().filters().create(userId="me", body=filter_body).execute()
-        print(f"Consolidated filter updated/created successfully: {res}")
-    except Exception as e:
-        print(f"Error creating updated filter: {e}")
+    # Format the new criteria chunks
+    criteria_strings = chunk_senders(existing_senders, max_len=1000)
+    
+    # Track which filters to keep and which new ones to create
+    filters_to_delete_ids = old_filter_ids.copy()
+    new_filters_created = []
+    success = True
+    
+    for criteria_str in criteria_strings:
+        # Check if this exact chunk already exists in Gmail
+        matched_filter = None
+        for flt in target_filters:
+            if flt.get("criteria", {}).get("from", "") == criteria_str:
+                matched_filter = flt
+                break
+                
+        if matched_filter:
+            # Chunk already exists. Keep it and remove from delete list
+            if matched_filter["id"] in filters_to_delete_ids:
+                filters_to_delete_ids.remove(matched_filter["id"])
+            print(f"Filter chunk already exists, keeping it (id: {matched_filter['id']})")
+        else:
+            filter_body = {
+                "criteria": {"from": criteria_str},
+                "action": {
+                    "removeLabelIds": ["UNREAD", "INBOX"],
+                    "addLabelIds": ["TRASH"]
+                }
+            }
+            try:
+                res = service.users().settings().filters().create(userId="me", body=filter_body).execute()
+                new_filters_created.append(res["id"])
+                print(f"Consolidated filter chunk created successfully (id: {res.get('id')})")
+            except Exception as e:
+                print(f"Error creating filter chunk: {e}")
+                success = False
+                break
+                
+    if success:
+        for old_id in filters_to_delete_ids:
+            try:
+                print(f"Deleting old obsolete filter (id: {old_id})...")
+                service.users().settings().filters().delete(userId="me", id=old_id).execute()
+            except Exception as e:
+                print(f"Error deleting old filter {old_id}: {e}")
+    else:
+        # Rollback newly created filters if creation failed
+        print("Failed to create all new filters. Rolling back (deleting newly created chunks)...")
+        for new_id in new_filters_created:
+            try:
+                service.users().settings().filters().delete(userId="me", id=new_id).execute()
+            except Exception as rollback_err:
+                print(f"Rollback error deleting filter {new_id}: {rollback_err}")
 
     # Retroactively trash all existing emails from the new sender
     try:
@@ -624,27 +679,24 @@ def create_gmail_category_filter(service, email_addr, category):
         print(f"Error listing filters: {e}")
         filters = []
         
-    target_filter = None
-    # Look for the consolidated filter: matches label_id and the expected inbox archiving action
+    target_filters = []
+    # Find all existing category filters matching the label ID and expected archive/inbox action
     for flt in filters:
         action = flt.get("action", {})
         add_labels = action.get("addLabelIds", [])
         remove_labels = action.get("removeLabelIds", [])
-        if label_id in add_labels:
+        if label_id in add_labels and "from" in flt.get("criteria", {}):
             if should_archive and "INBOX" in remove_labels:
-                target_filter = flt
-                break
+                target_filters.append(flt)
             elif not should_archive and "INBOX" not in remove_labels:
-                target_filter = flt
-                break
+                target_filters.append(flt)
             
     existing_senders = set()
-    old_filter_id = None
+    old_filter_ids = []
     
-    if target_filter:
-        old_filter_id = target_filter["id"]
-        from_criteria = target_filter.get("criteria", {}).get("from", "")
-        # Clean up parentheses
+    for flt in target_filters:
+        old_filter_ids.append(flt["id"])
+        from_criteria = flt.get("criteria", {}).get("from", "")
         cleaned_from = from_criteria.strip()
         if cleaned_from.startswith("(") and cleaned_from.endswith(")"):
             cleaned_from = cleaned_from[1:-1].strip()
@@ -658,44 +710,74 @@ def create_gmail_category_filter(service, email_addr, category):
                 existing_senders.add(p)
                 
     # Add new email address to set
-    existing_senders.add(email_addr.strip().lower())
-    
-    # Format the new criteria from string
-    if len(existing_senders) > 1:
-        from_str = f"({' OR '.join(sorted(existing_senders))})"
-    else:
-        from_str = next(iter(existing_senders))
+    new_sender = email_addr.strip().lower()
+    if new_sender in existing_senders:
+        print(f"Sender {new_sender} already exists in consolidated category filter. No changes needed.")
+        return
         
-    if should_archive:
-        filter_body = {
-            "criteria": {"from": from_str},
-            "action": {
-                "removeLabelIds": ["INBOX"],
-                "addLabelIds": [label_id]
-            }
-        }
-    else:
-        filter_body = {
-            "criteria": {"from": from_str},
-            "action": {
-                "addLabelIds": [label_id]
-            }
-        }
+    existing_senders.add(new_sender)
     
-    # Delete the old filter if it exists
-    if old_filter_id:
-        try:
-            print(f"Deleting old category filter (id: {old_filter_id})...")
-            service.users().settings().filters().delete(userId="me", id=old_filter_id).execute()
-        except Exception as e:
-            print(f"Error deleting old category filter: {e}")
+    # Format the new criteria chunks
+    criteria_strings = chunk_senders(existing_senders, max_len=1000)
+    
+    # Track which filters to keep and which new ones to create
+    filters_to_delete_ids = old_filter_ids.copy()
+    new_filters_created = []
+    success = True
+    
+    for criteria_str in criteria_strings:
+        # Check if this exact chunk already exists in Gmail
+        matched_filter = None
+        for flt in target_filters:
+            if flt.get("criteria", {}).get("from", "") == criteria_str:
+                matched_filter = flt
+                break
+                
+        if matched_filter:
+            # Chunk already exists. Keep it and remove from delete list
+            if matched_filter["id"] in filters_to_delete_ids:
+                filters_to_delete_ids.remove(matched_filter["id"])
+            print(f"Category filter chunk already exists, keeping it (id: {matched_filter['id']})")
+        else:
+            if should_archive:
+                filter_body = {
+                    "criteria": {"from": criteria_str},
+                    "action": {
+                        "removeLabelIds": ["INBOX"],
+                        "addLabelIds": [label_id]
+                    }
+                }
+            else:
+                filter_body = {
+                    "criteria": {"from": criteria_str},
+                    "action": {
+                        "addLabelIds": [label_id]
+                    }
+                }
+            try:
+                res = service.users().settings().filters().create(userId="me", body=filter_body).execute()
+                new_filters_created.append(res["id"])
+                print(f"Consolidated category filter chunk created successfully (id: {res.get('id')})")
+            except Exception as e:
+                print(f"Error creating category filter chunk: {e}")
+                success = False
+                break
             
-    # Create the new updated filter
-    try:
-        res = service.users().settings().filters().create(userId="me", body=filter_body).execute()
-        print(f"Consolidated '{label_name}' filter updated/created successfully: {res}")
-    except Exception as e:
-        print(f"Error creating updated category filter: {e}")
+    if success:
+        for old_id in filters_to_delete_ids:
+            try:
+                print(f"Deleting old obsolete category filter (id: {old_id})...")
+                service.users().settings().filters().delete(userId="me", id=old_id).execute()
+            except Exception as e:
+                print(f"Error deleting old category filter {old_id}: {e}")
+    else:
+        # Rollback newly created category filters if creation failed
+        print("Failed to create all new category filters. Rolling back (deleting newly created chunks)...")
+        for new_id in new_filters_created:
+            try:
+                service.users().settings().filters().delete(userId="me", id=new_id).execute()
+            except Exception as rollback_err:
+                print(f"Rollback error deleting category filter {new_id}: {rollback_err}")
         
     # Retroactively move all existing emails from the new sender
     try:
@@ -880,14 +962,251 @@ def classify_sender_ollama(email_addr, history):
     eval_count = res_json.get("eval_count", 0)
     eval_duration = res_json.get("eval_duration", 0) / 1e9
     tokens_per_sec = eval_count / eval_duration if eval_duration > 0 else 0
-    
     print(
-        f"[Ollama] Decision: is_newsletter = {is_newsletter}, category = {category}\n"
+        f"[Ollama {model}] Decision: is_newsletter = {is_newsletter}, category = {category}\n"
         f"  - Total Time: {duration:.2f}s (Ollama API: {total_duration:.2f}s, Load: {load_duration:.2f}s, Prompt Eval: {prompt_eval_duration:.2f}s, Gen: {eval_duration:.2f}s)\n"
         f"  - Tokens: Prompt = {prompt_eval_count}, Response = {eval_count}\n"
         f"  - Generation Speed: {tokens_per_sec:.2f} tokens/sec"
     )
     return is_newsletter, category
+
+
+def sync_newsletter_filters(service, newsletters: set[str]):
+    try:
+        results = service.users().settings().filters().list(userId="me").execute()
+        filters = results.get("filter", [])
+    except Exception as e:
+        print(f"Error listing filters: {e}")
+        filters = []
+        
+    old_filter_ids = []
+    existing_senders = set()
+    for flt in filters:
+        action = flt.get("action", {})
+        add_labels = action.get("addLabelIds", [])
+        remove_labels = action.get("removeLabelIds", [])
+        if "TRASH" in add_labels and "UNREAD" in remove_labels and "from" in flt.get("criteria", {}):
+            old_filter_ids.append(flt["id"])
+            from_criteria = flt.get("criteria", {}).get("from", "")
+            cleaned_from = from_criteria.strip()
+            if cleaned_from.startswith("(") and cleaned_from.endswith(")"):
+                cleaned_from = cleaned_from[1:-1].strip()
+            import re
+            parts = re.split(r'\s+[oO][rR]\s+', cleaned_from)
+            for part in parts:
+                p = part.strip().lower()
+                if p:
+                    existing_senders.add(p)
+                    
+    # If the exact set of newsletters already exists in Gmail, skip update to avoid duplicate filter errors
+    if newsletters == existing_senders:
+        print("Newsletters are already in sync. No changes needed.")
+        return
+            
+    # Chunk the entire newsletters set
+    criteria_strings = chunk_senders(newsletters, max_len=1000)
+    
+    # Track which filters to keep and which new ones to create
+    filters_to_delete_ids = old_filter_ids.copy()
+    new_filters_created = []
+    success = True
+    
+    # Target filters list in Gmail
+    target_filters = []
+    for flt in filters:
+        action = flt.get("action", {})
+        add_labels = action.get("addLabelIds", [])
+        remove_labels = action.get("removeLabelIds", [])
+        if "TRASH" in add_labels and "UNREAD" in remove_labels and "from" in flt.get("criteria", {}):
+            target_filters.append(flt)
+            
+    for criteria_str in criteria_strings:
+        # Check if this exact chunk already exists in Gmail
+        matched_filter = None
+        for flt in target_filters:
+            if flt.get("criteria", {}).get("from", "") == criteria_str:
+                matched_filter = flt
+                break
+                
+        if matched_filter:
+            # Chunk already exists. Keep it and remove from delete list
+            if matched_filter["id"] in filters_to_delete_ids:
+                filters_to_delete_ids.remove(matched_filter["id"])
+            print(f"TRASH filter chunk already exists, keeping it (id: {matched_filter['id']})")
+        else:
+            filter_body = {
+                "criteria": {"from": criteria_str},
+                "action": {
+                    "removeLabelIds": ["UNREAD", "INBOX"],
+                    "addLabelIds": ["TRASH"]
+                }
+            }
+            try:
+                res = service.users().settings().filters().create(userId="me", body=filter_body).execute()
+                new_filters_created.append(res["id"])
+                print(f"Consolidated TRASH filter chunk created (id: {res.get('id')})")
+            except Exception as e:
+                print(f"Error creating TRASH filter chunk: {e}")
+                success = False
+                break
+            
+    if success:
+        for old_id in filters_to_delete_ids:
+            try:
+                print(f"Deleting old obsolete TRASH filter (id: {old_id})...")
+                service.users().settings().filters().delete(userId="me", id=old_id).execute()
+            except Exception as e:
+                print(f"Error deleting old TRASH filter {old_id}: {e}")
+    else:
+        print("Failed to create all new TRASH filters. Rolling back (deleting newly created chunks)...")
+        for new_id in new_filters_created:
+            try:
+                service.users().settings().filters().delete(userId="me", id=new_id).execute()
+            except Exception as rollback_err:
+                print(f"Rollback error deleting TRASH filter {new_id}: {rollback_err}")
+
+
+def sync_category_filters(service, category: str, senders: set[str]):
+    label_name = f"Gemini/{category.capitalize()}"
+    should_archive = category.lower() not in {"personal", "profissional", "other"}
+    
+    label_id = get_or_create_label(service, label_name)
+    if not label_id:
+        print(f"Could not get or create label for '{label_name}'. Aborting sync for this category.")
+        return
+        
+    try:
+        results = service.users().settings().filters().list(userId="me").execute()
+        filters = results.get("filter", [])
+    except Exception as e:
+        print(f"Error listing filters: {e}")
+        filters = []
+        
+    old_filter_ids = []
+    existing_senders = set()
+    for flt in filters:
+        action = flt.get("action", {})
+        add_labels = action.get("addLabelIds", [])
+        remove_labels = action.get("removeLabelIds", [])
+        if label_id in add_labels and "from" in flt.get("criteria", {}):
+            matched = False
+            if should_archive and "INBOX" in remove_labels:
+                old_filter_ids.append(flt["id"])
+                matched = True
+            elif not should_archive and "INBOX" not in remove_labels:
+                old_filter_ids.append(flt["id"])
+                matched = True
+                
+            if matched:
+                from_criteria = flt.get("criteria", {}).get("from", "")
+                cleaned_from = from_criteria.strip()
+                if cleaned_from.startswith("(") and cleaned_from.endswith(")"):
+                    cleaned_from = cleaned_from[1:-1].strip()
+                import re
+                parts = re.split(r'\s+[oO][rR]\s+', cleaned_from)
+                for part in parts:
+                    p = part.strip().lower()
+                    if p:
+                        existing_senders.add(p)
+                        
+    # If the category is already in sync, skip update to avoid duplicate filter errors
+    if senders == existing_senders:
+        print(f"Category '{category}' is already in sync. No changes needed.")
+        return
+                
+    criteria_strings = chunk_senders(senders, max_len=1000)
+    
+    # Track which filters to keep and which new ones to create
+    filters_to_delete_ids = old_filter_ids.copy()
+    new_filters_created = []
+    success = True
+    
+    # Target filters list for this category currently in Gmail
+    target_category_filters = []
+    for flt in filters:
+        action = flt.get("action", {})
+        add_labels = action.get("addLabelIds", [])
+        remove_labels = action.get("removeLabelIds", [])
+        if label_id in add_labels and "from" in flt.get("criteria", {}):
+            if should_archive and "INBOX" in remove_labels:
+                target_category_filters.append(flt)
+            elif not should_archive and "INBOX" not in remove_labels:
+                target_category_filters.append(flt)
+                
+    for criteria_str in criteria_strings:
+        # Check if this exact chunk already exists in Gmail
+        matched_filter = None
+        for flt in target_category_filters:
+            if flt.get("criteria", {}).get("from", "") == criteria_str:
+                matched_filter = flt
+                break
+                
+        if matched_filter:
+            # Chunk already exists. Keep it and remove from delete list
+            if matched_filter["id"] in filters_to_delete_ids:
+                filters_to_delete_ids.remove(matched_filter["id"])
+            print(f"Category '{category}' filter chunk already exists, keeping it (id: {matched_filter['id']})")
+        else:
+            if should_archive:
+                filter_body = {
+                    "criteria": {"from": criteria_str},
+                    "action": {
+                        "removeLabelIds": ["INBOX"],
+                        "addLabelIds": [label_id]
+                    }
+                }
+            else:
+                filter_body = {
+                    "criteria": {"from": criteria_str},
+                    "action": {
+                        "addLabelIds": [label_id]
+                    }
+                }
+            try:
+                res = service.users().settings().filters().create(userId="me", body=filter_body).execute()
+                new_filters_created.append(res["id"])
+                print(f"Consolidated '{label_name}' filter chunk created (id: {res.get('id')})")
+            except Exception as e:
+                print(f"Error creating '{label_name}' filter chunk: {e}")
+                success = False
+                break
+            
+    if success:
+        for old_id in filters_to_delete_ids:
+            try:
+                print(f"Deleting old obsolete '{label_name}' filter (id: {old_id})...")
+                service.users().settings().filters().delete(userId="me", id=old_id).execute()
+            except Exception as e:
+                print(f"Error deleting old '{label_name}' filter {old_id}: {e}")
+    else:
+        print(f"Failed to create all new '{label_name}' filters. Rolling back (deleting newly created chunks)...")
+        for new_id in new_filters_created:
+            try:
+                service.users().settings().filters().delete(userId="me", id=new_id).execute()
+            except Exception as rollback_err:
+                print(f"Rollback error deleting filter {new_id}: {rollback_err}")
+
+
+def sync_processed_senders_to_gmail(service, processed_dict):
+    # Group senders by category
+    categories = {}
+    for email, category in processed_dict.items():
+        categories.setdefault(category, set()).add(email)
+        
+    print(f"Syncing filters for {len(processed_dict)} senders across {len(categories)} categories...")
+    
+    # 1. Sync newsletters (consolidated TRASH filters)
+    newsletters = categories.get("newsletter", set())
+    if newsletters:
+        print(f"Syncing {len(newsletters)} newsletter senders...")
+        sync_newsletter_filters(service, newsletters)
+        
+    # 2. Sync category filters
+    for cat, senders in categories.items():
+        if cat == "newsletter":
+            continue
+        print(f"Syncing {len(senders)} senders for category '{cat}'...")
+        sync_category_filters(service, cat, senders)
 
 
 def main():
@@ -898,6 +1217,17 @@ def main():
     processed_dict = load_processed_senders()
     processed_set = set(processed_dict.keys())
     print(f"Loaded processed list with {len(processed_set)} senders.")
+    
+    import sys
+    if "--sync" in sys.argv:
+        print("Sync mode activated: Rebuilding all Gmail filters from local JSON database...")
+        sync_processed_senders_to_gmail(service, processed_dict)
+        print("Sync completed successfully.")
+        return
+
+    print("Sync mode activated: Rebuilding all Gmail filters from local JSON database...")
+    sync_processed_senders_to_gmail(service, processed_dict)
+    print("Sync completed successfully.")
     
     user_data_dir = Path("sandbox/playwright_user_data")
     user_data_dir.mkdir(parents=True, exist_ok=True)
