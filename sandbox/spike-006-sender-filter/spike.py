@@ -461,9 +461,153 @@ class GeminiWebClassifier:
         if self.playwright:
             self.playwright.stop()
 
+def extrair_empresa(email: str) -> str:
+    if '@' not in email:
+        partes_espaco = email.strip().split()
+        if len(partes_espaco) >= 2:
+            dominio = partes_espaco[-1]
+        else:
+            return email
+    else:
+        parts_by_at = email.split('@')
+        dominio = parts_by_at[1] if parts_by_at[0] == '' else parts_by_at[1]
+        
+    partes = dominio.split('.')
+    if dominio.endswith('.com.br') and len(partes) >= 3:
+        return partes[-3]
+    elif len(partes) >= 2:
+        return partes[-2]
+    return dominio
+
+
+def tokenize_username(username: str) -> list[str]:
+    import re
+    return [t for t in re.split(r'[\.\-\_\+]', username.lower()) if t]
+
+
+def generalize_senders(senders: set[str], threshold: int = 3) -> set[str]:
+    # --- Hard-coded configurations defined at the very beginning of the method ---
+    NOREPLY_VARIATIONS = {
+        "noreply", "no-reply", "noreplay", "no-replay", "non-reply", "no_reply", "no_replay",
+        "naoresponda", "nao-responda", "nao_responda", "naoresponder", "nao-responder", "nao_responder",
+        "donotreply", "do-not-reply", "do_not_reply", "dontreply", "dont-reply", "dont_reply",
+        "semresposta", "sem-resposta", "sem_resposta"
+    }
+    NOREPLY_CLEANED = {
+        "noreply", "noreplay", "nonreply", "naoresponda", "naoresponder", "donotreply", "dontreply", "semresposta"
+    }
+    BULK_TLDS = {"myactivecampaign.com", "shopifyemail.com", "bazaarvoice-cgc.com"}
+    MKT_SUBDOMAIN_PREFIXES = {"news", "mkt", "deals", "mail", "selections", "newarrival", "email", "notifications", "alerts", "promocao", "promocoes"}
+    
+    domain_groups = {}
+    for email in senders:
+        if '@' in email:
+            if email.startswith('@'):
+                domain = email[1:]
+            else:
+                domain = email.split('@')[1]
+            domain_groups.setdefault(domain, []).append(email)
+            
+    generalized = set()
+    
+    for domain, emails in domain_groups.items():
+        partes = domain.split('.')
+        is_subdomain = len(partes) > 2
+        prefix = partes[0] if is_subdomain else ""
+        
+        is_bulk_domain = any(tld in domain for tld in BULK_TLDS)
+        is_marketing_subdomain = prefix in MKT_SUBDOMAIN_PREFIXES
+        
+        has_wildcard = any(e.startswith('@') for e in emails)
+        
+        # Category 1: Dedicated Subdomain or platform domain -> Safe to wildcard entirely
+        if has_wildcard or is_bulk_domain or is_marketing_subdomain:
+            generalized.add(f"@{domain}")
+            if not has_wildcard:
+                print(f"[Wildcard] Consolidating {len(emails)} senders under @{domain}")
+            continue
+            
+        # Category 2: Corporate/Shared Domain (e.g. google.com, unimedpoa.com.br)
+        # Identify common automation keywords (like noreply, marketing, pesquisas)
+        token_frequencies = {}
+        emails_by_token = {}
+        
+        for email in emails:
+            # If it's already a query pattern like "(noreply...) google.com", skip
+            if not email.startswith('(') and '@' in email:
+                username = email.split('@')[0].lower()
+                tokens = tokenize_username(username)
+                
+                # Check cleaned username without delimiters
+                username_cleaned = username.replace("-", "").replace("_", "").replace("+", "").replace(".", "")
+                
+                normalized_tokens = set()
+                # Determine if any of the split tokens is in NOREPLY_VARIATIONS or username_cleaned is in NOREPLY_CLEANED
+                is_noreply = False
+                if username_cleaned in NOREPLY_CLEANED or any(part in username_cleaned for part in NOREPLY_CLEANED):
+                    is_noreply = True
+                else:
+                    for t in tokens:
+                        if t in NOREPLY_VARIATIONS:
+                            is_noreply = True
+                            break
+                            
+                if is_noreply:
+                    normalized_tokens.add("noreply-token")
+                
+                # Also process other tokens
+                for t in tokens:
+                    if t not in NOREPLY_VARIATIONS:
+                        normalized_tokens.add(t)
+                        
+                for t in normalized_tokens:
+                    token_frequencies[t] = token_frequencies.get(t, 0) + 1
+                    emails_by_token.setdefault(t, []).append(email)
+            elif email.startswith('('):
+                # Keep existing query patterns
+                generalized.add(email)
+                
+        # Find tokens that meet the threshold
+        auto_tokens = [t for t, freq in token_frequencies.items() if freq >= threshold]
+        
+        if auto_tokens:
+            consolidated_emails = set()
+            for token in auto_tokens:
+                consolidated_emails.update(emails_by_token[token])
+                if token == "noreply-token":
+                    token_query = "(noreply OR no-reply OR naoresponda OR nao-responder OR donotreply OR do-not-reply)"
+                else:
+                    token_query = token
+                    
+                pattern_query = f"{token_query} {domain}"
+                generalized.add(pattern_query)
+                print(f"[Pattern Wildcard] Consolidating {len(emails_by_token[token])} senders under pattern '{pattern_query}'")
+                
+            # Keep individual emails that did not match any automated token
+            for email in emails:
+                if not email.startswith('(') and email not in consolidated_emails:
+                    generalized.add(email)
+        else:
+            # No pattern met the threshold, keep individual emails
+            for email in emails:
+                generalized.add(email)
+                
+    return generalized
+
+
 def chunk_senders(senders: set[str], max_len: int = 1000) -> list[str]:
-    # Returns a list of criteria strings, each formatted as (email1 OR email2 OR ...)
-    sorted_senders = sorted(list(senders))
+    # 1. Apply domain-level and pattern generalization to reduce filter size safely
+    generalized_senders = generalize_senders(senders, threshold=3)
+    
+    # 2. Sort the generalized senders list
+    sorted_senders = sorted(
+        list(generalized_senders),
+        key=lambda x: (
+            extrair_empresa(x),
+            x.split('@')[1] if '@' in x else (x.split()[-1] if len(x.split()) >= 2 else ''),
+            x.split('@')[0] if '@' in x else x
+        )
+    )
     chunks = []
     current_chunk = []
     current_len = 0
@@ -654,11 +798,14 @@ def get_or_create_label(service, label_name):
 
 
 def create_gmail_category_filter(service, email_addr, category):
+    NON_ARCHIVE_CATEGORIES = {"personal", "profissional", "other"}
+    LABEL_PREFIX = "Gemini/"
+    
     # Capitalize label name and prepend prefix
-    label_name = f"Gemini/{category.capitalize()}"
+    label_name = f"{LABEL_PREFIX}{category.capitalize()}"
     
     # Determine if we should archive (remove from INBOX) for this category
-    should_archive = category.lower() not in {"personal", "profissional", "other"}
+    should_archive = category.lower() not in NON_ARCHIVE_CATEGORIES
     
     if should_archive:
         print(f"Adding {email_addr} to consolidated Gmail category filter: {label_name} (with Inbox archiving)...")
@@ -1067,8 +1214,11 @@ def sync_newsletter_filters(service, newsletters: set[str]):
 
 
 def sync_category_filters(service, category: str, senders: set[str]):
-    label_name = f"Gemini/{category.capitalize()}"
-    should_archive = category.lower() not in {"personal", "profissional", "other"}
+    NON_ARCHIVE_CATEGORIES = {"personal", "profissional", "other"}
+    LABEL_PREFIX = "Gemini/"
+    
+    label_name = f"{LABEL_PREFIX}{category.capitalize()}"
+    should_archive = category.lower() not in NON_ARCHIVE_CATEGORIES
     
     label_id = get_or_create_label(service, label_name)
     if not label_id:
