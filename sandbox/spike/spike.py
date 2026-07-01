@@ -1380,14 +1380,25 @@ def main():
     user_data_dir = Path("sandbox/playwright_user_data")
     user_data_dir.mkdir(parents=True, exist_ok=True)
     
+    # Fetch total messages in INBOX before entering the loop
+    try:
+        inbox_status = service.users().labels().get(userId="me", id="INBOX").execute()
+        total_inbox = inbox_status.get("messagesTotal", 0)
+        print(f"Total messages in INBOX: {total_inbox}")
+    except Exception as e:
+        total_inbox = 0
+        print(f"Could not fetch INBOX label stats: {e}")
+        
     with GeminiWebClassifier(user_data_dir) as classifier:
         next_page_token = None
         evaluated_messages_count = 0
         processed_senders_count = 0
+        page_number = 0
         
         print("Starting message-by-message inbox analysis...")
         while True:
-            print(f"Fetching page of inbox messages (token: {next_page_token})...")
+            page_number += 1
+            print(f"Fetching page {page_number} of inbox messages (token: {next_page_token})...")
             try:
                 results = service.users().messages().list(
                     userId="me", 
@@ -1433,10 +1444,32 @@ def main():
             except Exception as e:
                 print(f"Error executing batch request: {e}")
                 break
+            
+            # Count processed vs. new senders on the current page
+            page_processed_count = 0
+            page_new_count = 0
+            for msg in messages:
+                msg_id = msg["id"]
+                from_val = senders_map.get(msg_id)
+                if not from_val:
+                    continue
+                email_addr = from_val
+                if "<" in from_val and ">" in from_val:
+                    email_addr = from_val.split("<")[1].split(">")[0]
+                email_addr = email_addr.strip().lower()
+                
+                if email_addr in processed_set:
+                    page_processed_count += 1
+                else:
+                    page_new_count += 1
+            
+            print(f"Page {page_number} Summary: {len(messages)} messages total ({page_processed_count} already processed, {page_new_count} new senders)")
     
+            current_in_page = 0
             for msg in messages:
                 msg_id = msg["id"]
                 evaluated_messages_count += 1
+                current_in_page += 1
                 
                 from_val = senders_map.get(msg_id)
                 if not from_val:
@@ -1453,7 +1486,7 @@ def main():
                     
                 # We found a new unprocessed sender!
                 print(f"\n==========================================")
-                print(f"Processing new sender: {email_addr} (From: {from_val})")
+                print(f"[{evaluated_messages_count}/{total_inbox}] Processing new sender on Page {page_number} (msg {current_in_page}/{len(messages)}): {email_addr} (From: {from_val})")
                 
                 history, unsub_link = fetch_sender_history(service, email_addr)
                 print(f"Fetched {len(history)} messages from sender history.")
