@@ -1364,7 +1364,7 @@ def main():
     processed_dict = load_processed_senders()
     processed_set = set(processed_dict.keys())
     print(f"Loaded processed list with {len(processed_set)} senders.")
-    
+
     import sys
     if "--sync" in sys.argv:
         print("Sync mode activated: Rebuilding all Gmail filters from local JSON database...")
