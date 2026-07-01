@@ -1395,6 +1395,9 @@ def main():
         processed_senders_count = 0
         page_number = 0
         
+        import time
+        start_time = time.time()
+        
         print("Starting message-by-message inbox analysis...")
         while True:
             page_number += 1
@@ -1463,7 +1466,29 @@ def main():
                 else:
                     page_new_count += 1
             
-            print(f"Page {page_number} Summary: {len(messages)} messages total ({page_processed_count} already processed, {page_new_count} new senders)")
+            # Calculate page summary progress and ETA (excluding already processed/skipped senders from progress/ETA calculations)
+            import time
+            elapsed = time.time() - start_time
+            projected_evaluated = evaluated_messages_count + len(messages)
+            projected_new_senders = processed_senders_count + page_new_count
+            if projected_new_senders > 0 and projected_evaluated > 0 and total_inbox > 0:
+                density = projected_new_senders / projected_evaluated
+                estimated_total_new_senders = max(projected_new_senders, int(total_inbox * density))
+                pct = (projected_new_senders / estimated_total_new_senders) * 100
+                
+                rate = projected_evaluated / elapsed
+                remaining_msgs = total_inbox - projected_evaluated
+                remaining_time = remaining_msgs / rate if rate > 0 else 0
+                
+                hours = int(remaining_time // 3600)
+                minutes = int((remaining_time % 3600) // 60)
+                seconds = int(remaining_time % 60)
+                formatted_eta = f"{hours:02d}h{minutes:02d}m{seconds:02d}s"
+                progress_str = f"{projected_new_senders}/{estimated_total_new_senders} = {pct:.2f}% ETA {formatted_eta}"
+            else:
+                progress_str = f"{projected_new_senders}/estimating..."
+
+            print(f"Page {page_number} Summary: {len(messages)} messages total ({page_processed_count} already processed, {page_new_count} new senders) | Progress: {progress_str} (Inbox: {projected_evaluated}/{total_inbox})")
     
             current_in_page = 0
             for msg in messages:
@@ -1484,9 +1509,30 @@ def main():
                 if email_addr in processed_set:
                     continue
                     
+                # Calculate ETA based on elapsed time and progress (excluding already processed senders)
+                current_processed = processed_senders_count + 1
+                import time
+                elapsed = time.time() - start_time
+                if current_processed > 0 and evaluated_messages_count > 0 and total_inbox > 0:
+                    density = current_processed / evaluated_messages_count
+                    estimated_total_new_senders = max(current_processed, int(total_inbox * density))
+                    pct = (current_processed / estimated_total_new_senders) * 100
+                    
+                    rate = evaluated_messages_count / elapsed
+                    remaining_msgs = total_inbox - evaluated_messages_count
+                    remaining_time = remaining_msgs / rate if rate > 0 else 0
+                    
+                    hours = int(remaining_time // 3600)
+                    minutes = int((remaining_time % 3600) // 60)
+                    seconds = int(remaining_time % 60)
+                    formatted_eta = f"{hours:02d}h{minutes:02d}m{seconds:02d}s"
+                    progress_str = f"{current_processed}/{estimated_total_new_senders} = {pct:.2f}% ETA {formatted_eta}"
+                else:
+                    progress_str = f"{current_processed}/estimating..."
+
                 # We found a new unprocessed sender!
                 print(f"\n==========================================")
-                print(f"[{evaluated_messages_count}/{total_inbox}] Processing new sender on Page {page_number} (msg {current_in_page}/{len(messages)}): {email_addr} (From: {from_val})")
+                print(f"[{progress_str}] (Inbox: {evaluated_messages_count}/{total_inbox}) Processing new sender on Page {page_number} (msg {current_in_page}/{len(messages)}): {email_addr} (From: {from_val})")
                 
                 history, unsub_link = fetch_sender_history(service, email_addr)
                 print(f"Fetched {len(history)} messages from sender history.")
